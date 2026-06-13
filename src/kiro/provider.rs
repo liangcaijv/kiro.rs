@@ -39,6 +39,8 @@ pub struct KiroProvider {
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
+    /// 中转接口 client（固定无代理）。仅当 relay 配置生效时为 Some。
+    relay_client: Option<Client>,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
@@ -71,11 +73,36 @@ impl KiroProvider {
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
+        // 中转接口固定不走代理：仅当 relay 配置生效时构建独立的无代理 Client
+        let relay_client = if token_manager.config().relay.is_active() {
+            match build_client(None, 720, tls_backend) {
+                Ok(c) => {
+                    tracing::info!(
+                        "中转接口已启用: {}",
+                        token_manager
+                            .config()
+                            .relay
+                            .url
+                            .as_deref()
+                            .unwrap_or_default()
+                    );
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::error!("构建中转 HTTP 客户端失败，已禁用中转: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             token_manager,
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
+            relay_client,
             endpoints,
             default_endpoint,
         }
@@ -106,6 +133,69 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 尝试通过中转接口发送聊天请求
+    ///
+    /// 中转接口透传 Kiro 聊天接口的 body，请求头与真实 Kiro 保持一致（复用
+    /// `endpoint.decorate_api`），额外追加 `X-Api-Key`，并固定不走代理。
+    ///
+    /// 返回值：
+    /// - `Some(resp)`：中转返回 2xx，直接采用该响应（event-stream 解码完全复用）
+    /// - `None`：未启用中转、发送出错或返回非 2xx，调用方应回退到真实 Kiro
+    async fn try_relay(
+        &self,
+        endpoint: &Arc<dyn KiroEndpoint>,
+        rctx: &RequestContext<'_>,
+        body: &str,
+        cred_id: u64,
+    ) -> Option<reqwest::Response> {
+        let relay_client = self.relay_client.as_ref()?;
+        let cfg = &rctx.config.relay;
+        if !cfg.is_active() {
+            return None;
+        }
+        let url = cfg.url.as_deref()?;
+        let api_key = cfg.api_key.as_deref()?;
+
+        // 与真实 Kiro 一致的请求头（复用 decorate_api），再追加 X-Api-Key
+        let base = relay_client
+            .post(url)
+            .body(body.to_string())
+            .header("content-type", "application/json")
+            .header("Connection", "close");
+        let request = endpoint
+            .decorate_api(base, rctx)
+            .header("X-Api-Key", api_key);
+
+        match request.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    "[渠道=中转] 请求成功 (凭据 #{}, url={})",
+                    cred_id,
+                    url
+                );
+                Some(resp)
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    "[渠道=中转] 返回非成功状态 {}，回退到 [渠道=Kiro直连] (凭据 #{}, url={})",
+                    resp.status(),
+                    cred_id,
+                    url
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[渠道=中转] 发送失败，回退到 [渠道=Kiro直连] (凭据 #{}, url={}): {}",
+                    cred_id,
+                    url,
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// 发送非流式 API 请求
@@ -322,6 +412,13 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
+            // 优先尝试中转接口；任何失败（发送出错或非 2xx）都回退到真实 Kiro。
+            // 中转挂掉不应惩罚凭据，故失败时不计入 report_failure，直接走下方真实 Kiro 流程。
+            if let Some(resp) = self.try_relay(&endpoint, &rctx, &body, ctx.id).await {
+                self.token_manager.report_success(ctx.id);
+                return Ok(resp);
+            }
+
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
@@ -353,6 +450,7 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                tracing::info!("[渠道=Kiro直连] 请求成功 (凭据 #{})", ctx.id);
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }

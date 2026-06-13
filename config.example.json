@@ -5,5 +5,10 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "relay": {
+    "enabled": false,
+    "url": "http://64.20.54.18:15001/sendMessage",
+    "apiKey": "sk-your-relay-key"
+  }
 }

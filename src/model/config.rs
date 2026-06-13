@@ -17,6 +17,36 @@ impl Default for TlsBackend {
     }
 }
 
+/// 中转接口配置
+///
+/// 启用后，聊天请求（generateAssistantResponse）会优先发送到中转接口，
+/// 中转接口任何失败（发送出错或非 2xx 响应）都会回退到真实 Kiro 流程。
+/// 中转接口固定不走代理。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayConfig {
+    /// 是否启用中转
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 中转接口地址（如 http://host:port/sendMessage）
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// 中转接口密钥（写入 X-Api-Key 请求头）
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl RelayConfig {
+    /// 仅当 enabled 且 url、api_key 均非空时视为生效
+    pub fn is_active(&self) -> bool {
+        self.enabled
+            && self.url.as_deref().is_some_and(|u| !u.trim().is_empty())
+            && self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +139,12 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 中转接口配置（可选）
+    ///
+    /// 启用后聊天请求优先走中转接口，失败回退真实 Kiro。
+    #[serde(default)]
+    pub relay: RelayConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -184,6 +220,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            relay: RelayConfig::default(),
             config_path: None,
         }
     }
@@ -238,5 +275,69 @@ impl Config {
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
         fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relay_config_is_active() {
+        // 全部齐备 → 生效
+        let cfg = RelayConfig {
+            enabled: true,
+            url: Some("http://example.com/sendMessage".to_string()),
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(cfg.is_active());
+    }
+
+    #[test]
+    fn test_relay_config_disabled() {
+        let cfg = RelayConfig {
+            enabled: false,
+            url: Some("http://example.com/sendMessage".to_string()),
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(!cfg.is_active());
+    }
+
+    #[test]
+    fn test_relay_config_missing_url_or_key() {
+        // 缺 url
+        let cfg = RelayConfig {
+            enabled: true,
+            url: None,
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(!cfg.is_active());
+
+        // 缺 api_key
+        let cfg = RelayConfig {
+            enabled: true,
+            url: Some("http://example.com/sendMessage".to_string()),
+            api_key: None,
+        };
+        assert!(!cfg.is_active());
+
+        // 空白字符串视为未配置
+        let cfg = RelayConfig {
+            enabled: true,
+            url: Some("   ".to_string()),
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(!cfg.is_active());
+    }
+
+    #[test]
+    fn test_relay_config_default_is_inactive() {
+        assert!(!RelayConfig::default().is_active());
+    }
+
+    #[test]
+    fn test_config_default_relay_inactive() {
+        // Config 默认不应启用中转
+        assert!(!Config::default().relay.is_active());
     }
 }
