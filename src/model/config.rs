@@ -22,6 +22,10 @@ impl Default for TlsBackend {
 /// 启用后，聊天请求（generateAssistantResponse）会优先发送到中转接口，
 /// 中转接口任何失败（发送出错或非 2xx 响应）都会回退到真实 Kiro 流程。
 /// 中转接口固定不走代理。
+///
+/// 聊天接口（`url`）与 MCP/WebSearch 接口（`mcp_url`）各自独立：
+/// 仅配置 `url` 时只有聊天走中转，WebSearch 仍直连真实 Kiro；
+/// 同时配置 `mcp_url` 后 WebSearch 也走中转。两者共用 `api_key`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayConfig {
@@ -29,20 +33,31 @@ pub struct RelayConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// 中转接口地址（如 http://host:port/sendMessage）
+    /// 聊天接口中转地址（如 http://host:port/sendMessage）
     #[serde(default)]
     pub url: Option<String>,
 
-    /// 中转接口密钥（写入 X-Api-Key 请求头）
+    /// MCP/WebSearch 接口中转地址（如 http://host:port/mcp）
+    #[serde(default)]
+    pub mcp_url: Option<String>,
+
+    /// 中转接口密钥（写入 X-Api-Key 请求头，聊天与 MCP 共用）
     #[serde(default)]
     pub api_key: Option<String>,
 }
 
 impl RelayConfig {
-    /// 仅当 enabled 且 url、api_key 均非空时视为生效
+    /// 聊天中转是否生效：enabled 且 url、api_key 均非空
     pub fn is_active(&self) -> bool {
         self.enabled
             && self.url.as_deref().is_some_and(|u| !u.trim().is_empty())
+            && self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+    }
+
+    /// MCP/WebSearch 中转是否生效：enabled 且 mcp_url、api_key 均非空
+    pub fn is_mcp_active(&self) -> bool {
+        self.enabled
+            && self.mcp_url.as_deref().is_some_and(|u| !u.trim().is_empty())
             && self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
     }
 }
@@ -288,6 +303,7 @@ mod tests {
         let cfg = RelayConfig {
             enabled: true,
             url: Some("http://example.com/sendMessage".to_string()),
+            mcp_url: None,
             api_key: Some("sk-test".to_string()),
         };
         assert!(cfg.is_active());
@@ -298,9 +314,11 @@ mod tests {
         let cfg = RelayConfig {
             enabled: false,
             url: Some("http://example.com/sendMessage".to_string()),
+            mcp_url: Some("http://example.com/mcp".to_string()),
             api_key: Some("sk-test".to_string()),
         };
         assert!(!cfg.is_active());
+        assert!(!cfg.is_mcp_active());
     }
 
     #[test]
@@ -309,6 +327,7 @@ mod tests {
         let cfg = RelayConfig {
             enabled: true,
             url: None,
+            mcp_url: None,
             api_key: Some("sk-test".to_string()),
         };
         assert!(!cfg.is_active());
@@ -317,6 +336,7 @@ mod tests {
         let cfg = RelayConfig {
             enabled: true,
             url: Some("http://example.com/sendMessage".to_string()),
+            mcp_url: None,
             api_key: None,
         };
         assert!(!cfg.is_active());
@@ -325,19 +345,58 @@ mod tests {
         let cfg = RelayConfig {
             enabled: true,
             url: Some("   ".to_string()),
+            mcp_url: None,
             api_key: Some("sk-test".to_string()),
         };
         assert!(!cfg.is_active());
     }
 
     #[test]
+    fn test_relay_config_mcp_active() {
+        // 同时配置 url 和 mcp_url：两者都生效
+        let cfg = RelayConfig {
+            enabled: true,
+            url: Some("http://example.com/sendMessage".to_string()),
+            mcp_url: Some("http://example.com/mcp".to_string()),
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(cfg.is_active());
+        assert!(cfg.is_mcp_active());
+    }
+
+    #[test]
+    fn test_relay_config_mcp_independent_of_chat() {
+        // 仅配置 mcp_url（无 url）：MCP 生效，聊天不生效
+        let cfg = RelayConfig {
+            enabled: true,
+            url: None,
+            mcp_url: Some("http://example.com/mcp".to_string()),
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(!cfg.is_active());
+        assert!(cfg.is_mcp_active());
+
+        // 仅配置 url（无 mcp_url）：聊天生效，MCP 不生效（向后兼容）
+        let cfg = RelayConfig {
+            enabled: true,
+            url: Some("http://example.com/sendMessage".to_string()),
+            mcp_url: None,
+            api_key: Some("sk-test".to_string()),
+        };
+        assert!(cfg.is_active());
+        assert!(!cfg.is_mcp_active());
+    }
+
+    #[test]
     fn test_relay_config_default_is_inactive() {
         assert!(!RelayConfig::default().is_active());
+        assert!(!RelayConfig::default().is_mcp_active());
     }
 
     #[test]
     fn test_config_default_relay_inactive() {
         // Config 默认不应启用中转
         assert!(!Config::default().relay.is_active());
+        assert!(!Config::default().relay.is_mcp_active());
     }
 }

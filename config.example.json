@@ -9,6 +9,7 @@
   "relay": {
     "enabled": false,
     "url": "http://64.20.54.18:15001/sendMessage",
+    "mcpUrl": "http://64.20.54.18:15001/mcp",
     "apiKey": "sk-your-relay-key"
   }
 }
