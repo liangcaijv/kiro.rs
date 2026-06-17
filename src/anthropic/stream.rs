@@ -523,8 +523,11 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
-    /// 输出 tokens 累计
+    /// 输出 tokens 累计（已弃用计数口径：保留字段仅为兼容，真实计数见 output_text）
     pub output_tokens: i32,
+    /// 累积的输出文本（正文 + 工具入参 JSON），流结束时用 `count_tokens`
+    /// 统一估算，与非流式 `estimate_output_tokens` 同源，避免两条路径口径不一致。
+    output_text: String,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -563,6 +566,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            output_text: String::new(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -699,8 +703,8 @@ impl StreamContext {
             return Vec::new();
         }
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        // 累积输出正文，流结束时统一用 count_tokens 估算（与非流式同源）。
+        self.output_text.push_str(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -1030,7 +1034,8 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+            // 工具入参 JSON 计入输出文本，统一在流结束时按 count_tokens 估算。
+            self.output_text.push_str(&tool_use.input);
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1141,6 +1146,11 @@ impl StreamContext {
             Some(split) => split.input_tokens,
             None => self.context_input_tokens.unwrap_or(self.input_tokens),
         };
+
+        // 输出 token 统一估算：对累积的全部输出文本一次性 count_tokens，
+        // 与非流式 estimate_output_tokens 完全同源（同一 tokenizer、同一分段系数），
+        // 避免之前流式按 chunk 累加粗糙启发式导致两条路径口径不一致。
+        self.output_tokens = crate::token::count_tokens(&self.output_text) as i32;
 
         // 生成最终事件
         events.extend(
@@ -1254,27 +1264,6 @@ impl BufferedStreamContext {
 
         std::mem::take(&mut self.event_buffer)
     }
-}
-
-/// 简单的 token 估算
-fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
-
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
-        }
-    }
-
-    // 中文约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
 }
 
 #[cfg(test)]
@@ -1490,13 +1479,6 @@ mod tests {
             }),
             "flushed text should equal the buffered prefix"
         );
-    }
-
-    #[test]
-    fn test_estimate_tokens() {
-        assert!(estimate_tokens("Hello") > 0);
-        assert!(estimate_tokens("你好") > 0);
-        assert!(estimate_tokens("Hello 你好") > 0);
     }
 
     #[test]
