@@ -98,10 +98,17 @@ impl CacheSplit {
     }
 }
 
-/// 一个缓存断点：到该断点为止的累积前缀哈希 + 累积 token 数。
-struct Breakpoint {
+/// 一个前缀点：到此块边界为止的累积前缀哈希 + 累积 token 数。
+///
+/// `is_breakpoint` 标记该位置是否带客户端 `cache_control` 断点：
+/// - 写入缓存表只在断点处发生（稀疏，控制基数）；
+/// - 查询命中时遍历**所有**前缀点（不只断点），因此即使客户端断点逐轮
+///   移动，只要前缀内容一致，当前请求在相同块边界会算出相同哈希而命中
+///   历史断点写入的前缀——这是贴近 Anthropic「逐前缀匹配」的关键。
+struct PrefixPoint {
     cumulative_hash: u64,
     cumulative_tokens: i32,
+    is_breakpoint: bool,
 }
 
 fn min_cacheable_tokens(model: &str) -> i32 {
@@ -204,30 +211,38 @@ fn feed_segment(
     *cumulative_tokens += crate::token::count_tokens(token_text) as i32;
 }
 
-/// 按规范顺序（tools → system → messages）遍历输入，在每个客户端断点处
-/// 记录累积前缀哈希与累积 token 数。
+/// 按规范顺序（tools → system → messages）遍历输入，在**每个块边界**记录一个
+/// 累积前缀点（哈希 + 累积 token），并标记其中带客户端 `cache_control` 的断点。
 ///
-/// 返回 (断点列表, 本地累积总 token)。token 计数复用 `crate::token::count_tokens`，
+/// 返回 (前缀点列表, 本地累积总 token)。token 计数复用 `crate::token::count_tokens`，
 /// 与现有总数估算同源，但这里是按段累加（同一套 tokenizer，不引入新的遍历语义）。
+///
+/// 关键：记录**每个**块边界（而非仅断点），是为了让查询能命中「客户端断点逐轮
+/// 移动、但前缀内容一致」的历史写入——这正是之前只在断点位置存/查导致大量 miss
+/// 的根因。写入仍只发生在断点（见 `is_breakpoint`），保持缓存基数稀疏。
 fn collect_breakpoints(
     scope_key: &str,
     top_level_cache_control: Option<&serde_json::Value>,
     system: Option<&[SystemMessage]>,
     messages: &[Message],
     tools: Option<&[Tool]>,
-) -> (Vec<Breakpoint>, i32) {
+) -> (Vec<PrefixPoint>, i32) {
     let mut hasher = Sha256::new();
     hasher.update(scope_key.as_bytes());
     hasher.update(b"\x00");
 
     let mut cumulative_tokens = 0i32;
-    let mut breakpoints = Vec::new();
+    let mut points: Vec<PrefixPoint> = Vec::new();
 
-    // 在当前累积状态上记录一个断点（克隆 hasher 以保留累积前缀）。
-    let push_bp = |hasher: &Sha256, cumulative_tokens: i32, breakpoints: &mut Vec<Breakpoint>| {
-        breakpoints.push(Breakpoint {
+    // 在当前累积状态上记录一个前缀点（克隆 hasher 以固化累积前缀）。
+    let push_point = |hasher: &Sha256,
+                      cumulative_tokens: i32,
+                      is_breakpoint: bool,
+                      points: &mut Vec<PrefixPoint>| {
+        points.push(PrefixPoint {
             cumulative_hash: finish_hash(hasher.clone()),
             cumulative_tokens,
+            is_breakpoint,
         });
     };
 
@@ -253,14 +268,12 @@ fn collect_breakpoints(
                 &tool_hash,
                 &format!("{} {} {}", tool.name, tool.description, schema),
             );
-            if tool
+            let is_bp = tool
                 .cache_control
                 .as_ref()
                 .map(|v| !v.is_null())
-                .unwrap_or(false)
-            {
-                push_bp(&hasher, cumulative_tokens, &mut breakpoints);
-            }
+                .unwrap_or(false);
+            push_point(&hasher, cumulative_tokens, is_bp, &mut points);
         }
     }
 
@@ -274,14 +287,12 @@ fn collect_breakpoints(
                 &msg.text,
                 &msg.text,
             );
-            if msg
+            let is_bp = msg
                 .cache_control
                 .as_ref()
                 .map(|v| !v.is_null())
-                .unwrap_or(false)
-            {
-                push_bp(&hasher, cumulative_tokens, &mut breakpoints);
-            }
+                .unwrap_or(false);
+            push_point(&hasher, cumulative_tokens, is_bp, &mut points);
         }
     }
 
@@ -293,6 +304,7 @@ fn collect_breakpoints(
         match &msg.content {
             serde_json::Value::String(s) => {
                 feed_segment(&mut hasher, &mut cumulative_tokens, "message_text", s, s);
+                push_point(&hasher, cumulative_tokens, false, &mut points);
             }
             serde_json::Value::Array(arr) => {
                 for block in arr {
@@ -308,9 +320,7 @@ fn collect_breakpoints(
                         &stable,
                         token_text,
                     );
-                    if has_cache_control(block) {
-                        push_bp(&hasher, cumulative_tokens, &mut breakpoints);
-                    }
+                    push_point(&hasher, cumulative_tokens, has_cache_control(block), &mut points);
                 }
             }
             _ => {}
@@ -318,26 +328,19 @@ fn collect_breakpoints(
     }
 
     // 顶层 cache_control 是 Anthropic automatic caching：自动把断点放到最后一个
-    // 可缓存块。这里用当前累计前缀近似，避免 sub2api 接入自动缓存请求时看不到 cache_*。
+    // 可缓存块。这里把最末前缀点标记为断点（若尚未标记），避免 sub2api 接入
+    // 自动缓存请求时看不到 cache_*。
     if top_level_cache_control
         .map(cache_control_enabled)
         .unwrap_or(false)
         && cumulative_tokens > 0
     {
-        let hash = finish_hash(hasher.clone());
-        let is_duplicate = breakpoints
-            .last()
-            .map(|bp| bp.cumulative_hash == hash && bp.cumulative_tokens == cumulative_tokens)
-            .unwrap_or(false);
-        if !is_duplicate {
-            breakpoints.push(Breakpoint {
-                cumulative_hash: hash,
-                cumulative_tokens,
-            });
+        if let Some(last) = points.last_mut() {
+            last.is_breakpoint = true;
         }
     }
 
-    (breakpoints, cumulative_tokens)
+    (points, cumulative_tokens)
 }
 
 #[cfg(test)]
@@ -450,6 +453,58 @@ mod tests {
             8000,
         );
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn moving_breakpoint_still_hits_stable_prefix() {
+        // 复现真实场景：Claude Code 每轮把 cache_control 断点移到对话末尾，
+        // 但前面的 system + 历史消息逐字节稳定。第二轮断点虽移到了更靠后的
+        // 位置，仍应命中第一轮在较前位置写入的稳定前缀。
+        let cache = test_cache();
+        let big_sys = "stable-system ".repeat(5000); // 稳定前缀，带断点
+        let system = vec![sys(&big_sys, true)];
+
+        // 第一轮：system 断点写入，message 只有一条短的（无断点）。
+        let first = compute_with_cache(
+            &cache,
+            "scope-move",
+            "claude-sonnet-4-6",
+            None,
+            Some(&system),
+            &[user_msg("round one question")],
+            None,
+            9000,
+        );
+        assert_eq!(first.cache_read_input_tokens, 0, "首轮无命中");
+        assert!(first.cache_creation_input_tokens > 0);
+
+        // 第二轮：相同 system（断点仍在），但对话变长——追加历史消息，
+        // 末尾再补一条带断点的消息（模拟断点“移动”到更靠后）。
+        let tail_block = json!([{
+            "type": "text",
+            "text": "round two appended content ".repeat(20),
+            "cache_control": {"type": "ephemeral"}
+        }]);
+        let second = compute_with_cache(
+            &cache,
+            "scope-move",
+            "claude-sonnet-4-6",
+            None,
+            Some(&system),
+            &[
+                user_msg("round one question"),
+                Message { role: "assistant".to_string(), content: json!("ok") },
+                Message { role: "user".to_string(), content: tail_block },
+            ],
+            None,
+            9000,
+        );
+
+        // 关键断言：尽管断点移动了，稳定的 system 前缀仍应命中 read。
+        assert!(
+            second.cache_read_input_tokens > 0,
+            "断点移动后，稳定前缀仍应命中缓存读取（修复前这里为 0）"
+        );
     }
 
     #[test]
@@ -724,13 +779,14 @@ fn compute_split_with_cache(
 ) -> CacheSplit {
     let total = total_input_tokens.max(0);
 
-    // 按规范顺序收集断点（带 cache_control 的位置）的累积前缀。
+    // 收集每个块边界的累积前缀点，并标记其中的客户端断点。
     // 累积 token 用本地估算单位，最后按真实总数 `total` 缩放，保证恒等式成立。
-    let (breakpoints, local_total) =
+    let (points, local_total) =
         collect_breakpoints(scope_key, top_level_cache_control, system, messages, tools);
 
-    // 没有客户端断点 —— 与真实 Anthropic 行为一致：不显示缓存。
-    if breakpoints.is_empty() || local_total == 0 {
+    // 没有任何客户端断点 —— 与真实 Anthropic 行为一致：不显示缓存。
+    let has_breakpoint = points.iter().any(|p| p.is_breakpoint);
+    if !has_breakpoint || local_total == 0 {
         return CacheSplit::passthrough(total);
     }
 
@@ -739,27 +795,29 @@ fn compute_split_with_cache(
 
     let min_cacheable_tokens = min_cacheable_tokens(model);
 
-    // 单趟遍历：查命中并写入/刷新缓存表。
-    // time_to_idle 下，命中的 `contains`（内部 get）已刷新空闲计时，无需再 insert；
-    // 只对未命中的达标前缀写入，避免冗余写。取最后一个命中的断点作为最长命中前缀。
+    // 查询：遍历**所有**达标前缀点找最长命中。即使客户端断点逐轮移动，只要
+    // 前缀内容一致，当前请求在相同块边界算出的哈希就与历史断点写入相同 → 命中。
+    // 命中的 `contains`（内部 get）在 time_to_idle 下已刷新空闲计时。
     let mut hit_local = 0i32;
-    for bp in &breakpoints {
-        if bp.cumulative_tokens < min_cacheable_tokens {
-            continue;
+    for p in &points {
+        if p.cumulative_tokens >= min_cacheable_tokens && cache.contains(p.cumulative_hash) {
+            hit_local = p.cumulative_tokens;
         }
-        if cache.contains(bp.cumulative_hash) {
-            hit_local = bp.cumulative_tokens;
-        } else {
-            cache.insert(bp.cumulative_hash);
+    }
+
+    // 写入：只在客户端断点处写（稀疏，控制缓存基数），供后续请求命中。
+    for p in &points {
+        if p.is_breakpoint && p.cumulative_tokens >= min_cacheable_tokens {
+            cache.insert(p.cumulative_hash);
         }
     }
 
     // 最大可缓存边界 = 最后一个达标断点的累积 token（本地单位）。
-    let cacheable_local = breakpoints
+    let cacheable_local = points
         .iter()
         .rev()
-        .find(|bp| bp.cumulative_tokens >= min_cacheable_tokens)
-        .map(|bp| bp.cumulative_tokens)
+        .find(|p| p.is_breakpoint && p.cumulative_tokens >= min_cacheable_tokens)
+        .map(|p| p.cumulative_tokens)
         .unwrap_or(0);
 
     // 命中的部分计入 read，未命中但可缓存的部分计入 creation，剩余尾部计入 input。
