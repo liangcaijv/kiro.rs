@@ -585,6 +585,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -625,6 +626,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -652,6 +654,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -677,6 +680,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 

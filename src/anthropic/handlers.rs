@@ -267,6 +267,8 @@ pub async fn post_messages(
         let cache_split = if state.simulate_cache {
             Some(cache_sim::compute_split(
                 &cache_scope_key(&payload),
+                &payload.model,
+                payload.cache_control.as_ref(),
                 payload.system.as_deref(),
                 &payload.messages,
                 payload.tools.as_deref(),
@@ -335,6 +337,8 @@ pub async fn post_messages(
         ) as i32;
         let split = cache_sim::compute_split(
             &scope,
+            &payload.model,
+            payload.cache_control.as_ref(),
             payload.system.as_deref(),
             &payload.messages,
             payload.tools.as_deref(),
@@ -830,6 +834,8 @@ pub async fn post_messages_cc(
         let cache_split = if state.simulate_cache {
             Some(cache_sim::compute_split(
                 &cache_scope_key(&payload),
+                &payload.model,
+                payload.cache_control.as_ref(),
                 payload.system.as_deref(),
                 &payload.messages,
                 payload.tools.as_deref(),
@@ -897,6 +903,8 @@ pub async fn post_messages_cc(
         ) as i32;
         let split = cache_sim::compute_split(
             &scope,
+            &payload.model,
+            payload.cache_control.as_ref(),
             payload.system.as_deref(),
             &payload.messages,
             payload.tools.as_deref(),
