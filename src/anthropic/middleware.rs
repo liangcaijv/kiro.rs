@@ -25,15 +25,18 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 是否模拟 prompt 缓存命中（伪造 cache_* token 字段）
+    pub simulate_cache: bool,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool, simulate_cache: bool) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            simulate_cache,
         }
     }
 

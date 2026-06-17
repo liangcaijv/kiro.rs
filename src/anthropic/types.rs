@@ -151,6 +151,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +200,9 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    /// 缓存断点标记（`cache_control: {type:"ephemeral"}`），仅用于模拟缓存拆分。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 工具定义
@@ -223,6 +227,10 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// 缓存断点标记（`cache_control: {type:"ephemeral"}`），仅用于模拟缓存拆分。
+    /// 不参与向 Kiro 上游的序列化（Kiro 协议无此概念）。
+    #[serde(default, skip_serializing)]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 内容块

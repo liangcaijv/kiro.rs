@@ -220,9 +220,10 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_split: Option<super::cache_sim::CacheSplit>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens, cache_split);
 
     stream::iter(
         events
@@ -238,6 +239,7 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_split: Option<super::cache_sim::CacheSplit>,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -246,6 +248,14 @@ fn generate_websearch_events(
     );
 
     // 1. message_start
+    let (ws_input, ws_creation, ws_read) = match &cache_split {
+        Some(split) => (
+            split.input_tokens,
+            split.cache_creation_input_tokens,
+            split.cache_read_input_tokens,
+        ),
+        None => (input_tokens, 0, 0),
+    };
     events.push(SseEvent::new(
         "message_start",
         json!({
@@ -258,10 +268,10 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": ws_input,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": ws_creation,
+                    "cache_read_input_tokens": ws_read
                 }
             }
         }),
@@ -475,6 +485,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    cache_split: Option<super::cache_sim::CacheSplit>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -508,7 +519,7 @@ pub async fn handle_websearch_request(
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
     let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens, cache_split);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -569,6 +580,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -599,6 +611,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
@@ -606,6 +619,7 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,

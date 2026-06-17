@@ -143,6 +143,16 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 是否模拟 prompt 缓存命中（默认 false）
+    ///
+    /// ⚠️ Kiro 后端不支持 prompt 缓存，也不返回缓存 token。启用后代理会在出口
+    /// **伪造** `cache_creation_input_tokens` / `cache_read_input_tokens` 字段，
+    /// 仅用于让 sub2api 等统计面板的缓存指标不为 0、成本曲线接近真实 Anthropic。
+    /// 它**不会**真的节省 token、额度或耗时。只认客户端真正打的 `cache_control`
+    /// 断点；关闭时行为与原先完全一致。
+    #[serde(default)]
+    pub simulate_cache: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -233,6 +243,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            simulate_cache: false,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             relay: RelayConfig::default(),

@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+use super::cache_sim::CacheSplit;
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -542,6 +544,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 模拟缓存拆分结果（None 表示未启用，usage 维持仅 input/output）
+    cache_split: Option<CacheSplit>,
 }
 
 impl StreamContext {
@@ -568,11 +572,27 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            cache_split: None,
         }
+    }
+
+    /// 设置模拟缓存拆分结果（启用 simulate_cache 时调用）
+    pub fn set_cache_split(&mut self, split: CacheSplit) {
+        self.cache_split = Some(split);
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let mut usage = json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": 1
+        });
+        // 启用模拟缓存时，message_start 即给出完整的 cache_* 字段（贴近真实 Anthropic）
+        if let Some(split) = &self.cache_split {
+            usage["input_tokens"] = json!(split.input_tokens);
+            usage["cache_creation_input_tokens"] = json!(split.cache_creation_input_tokens);
+            usage["cache_read_input_tokens"] = json!(split.cache_read_input_tokens);
+        }
         json!({
             "type": "message_start",
             "message": {
@@ -583,10 +603,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
@@ -1117,8 +1134,13 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值。
+        // 启用模拟缓存时，message_delta 报告拆分后的"未缓存" input，与 message_start
+        // 的 cache_* 字段保持恒等式一致。
+        let final_input_tokens = match &self.cache_split {
+            Some(split) => split.input_tokens,
+            None => self.context_input_tokens.unwrap_or(self.input_tokens),
+        };
 
         // 生成最终事件
         events.extend(
@@ -1168,6 +1190,11 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 设置模拟缓存拆分结果（启用 simulate_cache 时调用）
+    pub fn set_cache_split(&mut self, split: CacheSplit) {
+        self.inner.set_cache_split(split);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1208,9 +1235,15 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 input_tokens。
+        // 启用模拟缓存时，message_start 已带有拆分后的 input/cache_* 字段，
+        // 不能用 context 值覆盖，否则会破坏恒等式。
+        let simulate_cache = self.inner.cache_split.is_some();
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
+                if simulate_cache {
+                    continue;
+                }
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);

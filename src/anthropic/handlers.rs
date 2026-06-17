@@ -21,11 +21,22 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use super::cache_sim::{self, CacheSplit};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+/// 构造模拟缓存的隔离标识：`model | user_id`，防止跨模型/会话串味。
+fn cache_scope_key(payload: &MessagesRequest) -> String {
+    let user_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .unwrap_or("");
+    format!("{}|{}", payload.model, user_id)
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -253,7 +264,19 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let cache_split = if state.simulate_cache {
+            Some(cache_sim::compute_split(
+                &cache_scope_key(&payload),
+                payload.system.as_deref(),
+                &payload.messages,
+                payload.tools.as_deref(),
+                input_tokens,
+            ))
+        } else {
+            None
+        };
+
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
     }
 
     // 转换请求
@@ -300,13 +323,33 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
-    ) as i32;
+    // 估算输入 tokens（+ 可选的模拟缓存拆分）。
+    // 关闭模拟缓存时走 move 路径（无 clone），与原先行为完全一致、零额外开销。
+    let (input_tokens, cache_split) = if state.simulate_cache {
+        let scope = cache_scope_key(&payload);
+        let total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let split = cache_sim::compute_split(
+            &scope,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+            total,
+        );
+        (total, Some(split))
+    } else {
+        let total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system,
+            payload.messages,
+            payload.tools,
+        ) as i32;
+        (total, None)
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -324,6 +367,7 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_split,
             thinking_enabled,
             tool_name_map,
         )
@@ -331,7 +375,7 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, cache_split, extract_thinking, tool_name_map).await
     }
 }
 
@@ -341,6 +385,7 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_split: Option<CacheSplit>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
@@ -352,6 +397,9 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    if let Some(split) = cache_split {
+        ctx.set_cache_split(split);
+    }
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -477,6 +525,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    cache_split: Option<CacheSplit>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
@@ -638,6 +687,21 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 构建 usage 对象。启用模拟缓存时附带拆分后的 cache_* 字段，
+    // 此时 input_tokens 用拆分后的"未缓存"值以维持恒等式。
+    let usage = match &cache_split {
+        Some(split) => json!({
+            "input_tokens": split.input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": split.cache_creation_input_tokens,
+            "cache_read_input_tokens": split.cache_read_input_tokens
+        }),
+        None => json!({
+            "input_tokens": final_input_tokens,
+            "output_tokens": output_tokens
+        }),
+    };
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -647,10 +711,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -766,7 +827,19 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let cache_split = if state.simulate_cache {
+            Some(cache_sim::compute_split(
+                &cache_scope_key(&payload),
+                payload.system.as_deref(),
+                &payload.messages,
+                payload.tools.as_deref(),
+                input_tokens,
+            ))
+        } else {
+            None
+        };
+
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
     }
 
     // 转换请求
@@ -813,13 +886,32 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
-    ) as i32;
+    // 估算输入 tokens（+ 可选的模拟缓存拆分），逻辑同 /v1 路径。
+    let (input_tokens, cache_split) = if state.simulate_cache {
+        let scope = cache_scope_key(&payload);
+        let total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let split = cache_sim::compute_split(
+            &scope,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+            total,
+        );
+        (total, Some(split))
+    } else {
+        let total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system,
+            payload.messages,
+            payload.tools,
+        ) as i32;
+        (total, None)
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -837,6 +929,7 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            cache_split,
             thinking_enabled,
             tool_name_map,
         )
@@ -844,7 +937,7 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, cache_split, extract_thinking, tool_name_map).await
     }
 }
 
@@ -857,6 +950,7 @@ async fn handle_stream_request_buffered(
     request_body: &str,
     model: &str,
     estimated_input_tokens: i32,
+    cache_split: Option<CacheSplit>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
@@ -867,7 +961,10 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    if let Some(split) = cache_split {
+        ctx.set_cache_split(split);
+    }
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
