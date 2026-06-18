@@ -96,6 +96,24 @@ impl CacheSplit {
             cache_read_input_tokens: 0,
         }
     }
+
+    /// 按折扣系数衰减伪造出的 `cache_read`，差额回退到 `cache_creation`。
+    ///
+    /// 缓存读取按约 1/10 价计费，会把大段稳定前缀的扣费压得极低；本方法只保留
+    /// `cache_read × factor`，把被砍掉的部分计入 `cache_creation`（约 1.25 倍计费），
+    /// 用于抬高面板计费。`factor` 夹取到 `[0.0, 1.0]`，恒等式
+    /// `input + cache_creation + cache_read == 总输入` 保持不变。`factor == 1.0`
+    /// 时结果与衰减前完全一致（向后兼容）。
+    pub fn dampen_read(self, factor: f64) -> Self {
+        let f = factor.clamp(0.0, 1.0);
+        let kept = (self.cache_read_input_tokens as f64 * f).round() as i32;
+        let moved = self.cache_read_input_tokens - kept;
+        Self {
+            input_tokens: self.input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens + moved,
+            cache_read_input_tokens: kept,
+        }
+    }
 }
 
 /// 一个前缀点：到此块边界为止的累积前缀哈希 + 累积 token 数。
@@ -806,6 +824,53 @@ mod tests {
         assert_eq!(split, CacheSplit::passthrough(5000));
         cache.run_pending_tasks();
         assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn dampen_read_moves_to_creation_and_preserves_identity() {
+        let split = CacheSplit {
+            input_tokens: 100,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 1000,
+        };
+        let out = split.dampen_read(0.3);
+        // read 衰减到 30%，被砍掉的 700 转入 creation。
+        assert_eq!(out.cache_read_input_tokens, 300);
+        assert_eq!(out.cache_creation_input_tokens, 200 + 700);
+        assert_eq!(out.input_tokens, 100); // input 不动
+        // 恒等式保持。
+        assert_eq!(
+            out.input_tokens + out.cache_creation_input_tokens + out.cache_read_input_tokens,
+            split.input_tokens
+                + split.cache_creation_input_tokens
+                + split.cache_read_input_tokens
+        );
+    }
+
+    #[test]
+    fn dampen_read_factor_one_is_identity() {
+        let split = CacheSplit {
+            input_tokens: 42,
+            cache_creation_input_tokens: 7,
+            cache_read_input_tokens: 999,
+        };
+        assert_eq!(split.dampen_read(1.0), split);
+    }
+
+    #[test]
+    fn dampen_read_clamps_out_of_range_factor() {
+        let split = CacheSplit {
+            input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 500,
+        };
+        // factor < 0 夹到 0：read 全部转入 creation。
+        let low = split.dampen_read(-1.0);
+        assert_eq!(low.cache_read_input_tokens, 0);
+        assert_eq!(low.cache_creation_input_tokens, 500);
+        // factor > 1 夹到 1：保持不变。
+        let high = split.dampen_read(2.0);
+        assert_eq!(high, split);
     }
 }
 

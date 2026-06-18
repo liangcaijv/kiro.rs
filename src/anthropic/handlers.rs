@@ -265,15 +265,18 @@ pub async fn post_messages(
         ) as i32;
 
         let cache_split = if state.simulate_cache {
-            Some(cache_sim::compute_split(
-                &cache_scope_key(&payload),
-                &payload.model,
-                payload.cache_control.as_ref(),
-                payload.system.as_deref(),
-                &payload.messages,
-                payload.tools.as_deref(),
-                input_tokens,
-            ))
+            Some(
+                cache_sim::compute_split(
+                    &cache_scope_key(&payload),
+                    &payload.model,
+                    payload.cache_control.as_ref(),
+                    payload.system.as_deref(),
+                    &payload.messages,
+                    payload.tools.as_deref(),
+                    input_tokens,
+                )
+                .dampen_read(state.simulate_cache_read_factor),
+            )
         } else {
             None
         };
@@ -343,7 +346,8 @@ pub async fn post_messages(
             &payload.messages,
             payload.tools.as_deref(),
             total,
-        );
+        )
+        .dampen_read(state.simulate_cache_read_factor);
         (total, Some(split))
     } else {
         let total = token::count_all_tokens(
@@ -832,15 +836,18 @@ pub async fn post_messages_cc(
         ) as i32;
 
         let cache_split = if state.simulate_cache {
-            Some(cache_sim::compute_split(
-                &cache_scope_key(&payload),
-                &payload.model,
-                payload.cache_control.as_ref(),
-                payload.system.as_deref(),
-                &payload.messages,
-                payload.tools.as_deref(),
-                input_tokens,
-            ))
+            Some(
+                cache_sim::compute_split(
+                    &cache_scope_key(&payload),
+                    &payload.model,
+                    payload.cache_control.as_ref(),
+                    payload.system.as_deref(),
+                    &payload.messages,
+                    payload.tools.as_deref(),
+                    input_tokens,
+                )
+                .dampen_read(state.simulate_cache_read_factor),
+            )
         } else {
             None
         };
@@ -909,7 +916,8 @@ pub async fn post_messages_cc(
             &payload.messages,
             payload.tools.as_deref(),
             total,
-        );
+        )
+        .dampen_read(state.simulate_cache_read_factor);
         (total, Some(split))
     } else {
         let total = token::count_all_tokens(

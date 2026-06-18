@@ -39,8 +39,14 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     simulate_cache: bool,
+    simulate_cache_read_factor: f64,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking, simulate_cache);
+    let mut state = AppState::new(
+        api_key,
+        extract_thinking,
+        simulate_cache,
+        simulate_cache_read_factor,
+    );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

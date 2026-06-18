@@ -27,16 +27,25 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 是否模拟 prompt 缓存命中（伪造 cache_* token 字段）
     pub simulate_cache: bool,
+    /// 模拟缓存的读取折扣系数（0~1）：把伪造的 cache_read 按此衰减、差额转入
+    /// cache_creation，用于抬高面板计费。仅 simulate_cache=true 时生效。
+    pub simulate_cache_read_factor: f64,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool, simulate_cache: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        simulate_cache: bool,
+        simulate_cache_read_factor: f64,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
             simulate_cache,
+            simulate_cache_read_factor,
         }
     }
 

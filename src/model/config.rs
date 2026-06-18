@@ -153,6 +153,19 @@ pub struct Config {
     #[serde(default)]
     pub simulate_cache: bool,
 
+    /// 模拟缓存的读取折扣系数（0.0~1.0，默认 0.3）
+    ///
+    /// 仅在 `simulate_cache=true` 时生效。Kiro 后端不支持 prompt 缓存，本代理
+    /// 伪造的 `cache_read_input_tokens` 往往把整段稳定的大 system / 历史消息全部
+    /// 算成缓存读取，而缓存读取按约 1/10 价计费，导致面板上每条大请求的扣费极低。
+    ///
+    /// 本系数把伪造出的 cache_read 按 `factor` 衰减：只保留 `read × factor`，差额
+    /// 回退计入 `cache_creation`（按约 1.25 倍计费），从而抬高面板计费。值越小，
+    /// 缓存读取越少、计费越高；`1.0` 表示不衰减（与历史行为一致）。
+    /// 恒等式 `input + cache_creation + cache_read == 总输入` 始终成立。
+    #[serde(default = "default_simulate_cache_read_factor")]
+    pub simulate_cache_read_factor: f64,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -216,6 +229,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_simulate_cache_read_factor() -> f64 {
+    0.3
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -244,6 +261,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             simulate_cache: false,
+            simulate_cache_read_factor: default_simulate_cache_read_factor(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             relay: RelayConfig::default(),

@@ -163,6 +163,7 @@ async fn main() {
         Some(kiro_provider),
         config.extract_thinking,
         config.simulate_cache,
+        config.simulate_cache_read_factor,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
