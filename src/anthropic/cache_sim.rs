@@ -197,6 +197,27 @@ fn stable_json_without_cache_control(value: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
+/// 客户端（如 Claude Code）会在 system 文本里注入传输层元数据行，其中带有
+/// **每请求变化的 nonce**——例如：
+/// `x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<随机>;`
+/// 的 `cch=` 每次请求都不同。
+///
+/// 这类行不是提示词内容，但因为前缀按 tools→system→messages **顺序累积**哈希，
+/// 任何排在前面的易变行都会污染其后**所有**前缀点的哈希，使稳定的大段 system /
+/// 历史消息永远算不出与历史一致的哈希 → cache_read 恒为 0。
+///
+/// 因此仅在**计算前缀哈希时**剔除这些行；token 计数（`token_text`）与转发给
+/// Kiro 上游的实际内容都不受影响，恒等式 `input+creation+read==total` 仍成立。
+fn strip_volatile_lines(text: &str) -> String {
+    if !text.contains("x-anthropic-billing-header:") {
+        return text.to_string();
+    }
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("x-anthropic-billing-header:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn feed_segment(
     hasher: &mut Sha256,
     cumulative_tokens: &mut i32,
@@ -206,7 +227,8 @@ fn feed_segment(
 ) {
     hasher.update(label.as_bytes());
     hasher.update(b"\x1f");
-    hasher.update(hash_text.as_bytes());
+    // 哈希前剔除每请求变化的传输层元数据行，避免污染累积前缀。
+    hasher.update(strip_volatile_lines(hash_text).as_bytes());
     hasher.update(b"\x1e");
     *cumulative_tokens += crate::token::count_tokens(token_text) as i32;
 }
@@ -534,6 +556,54 @@ mod tests {
             8000,
         );
         assert_eq!(other.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn volatile_billing_header_does_not_break_prefix_hit() {
+        // 复现真实根因：Claude Code 在 system 文本里注入传输层元数据行，
+        // 其 `cch=` 是每请求变化的 nonce。它排在前缀哈希最前面，若不剔除会污染
+        // 其后所有累积前缀点的哈希，使稳定的大段 system 永远 miss（cache_read 恒 0）。
+        let cache = test_cache();
+        let stable = "stable-system-prompt ".repeat(5000); // 稳定大段，带断点
+
+        // 两轮唯一区别：billing header 的 cch nonce 不同（其余逐字节一致）。
+        let sys_round = |nonce: &str| {
+            vec![sys(
+                &format!(
+                    "x-anthropic-billing-header: cc_version=2.1; cc_entrypoint=vscode; cch={nonce};\n{stable}"
+                ),
+                true,
+            )]
+        };
+
+        let first = compute_with_cache(
+            &cache,
+            "scope-volatile",
+            "claude-sonnet-4-6",
+            None,
+            Some(&sys_round("c35ac")),
+            &[user_msg("q1")],
+            None,
+            8000,
+        );
+        assert_eq!(first.cache_read_input_tokens, 0, "首轮无命中");
+        assert!(first.cache_creation_input_tokens > 0);
+
+        // 第二轮：nonce 变了，但稳定前缀应仍命中（修复前这里为 0）。
+        let second = compute_with_cache(
+            &cache,
+            "scope-volatile",
+            "claude-sonnet-4-6",
+            None,
+            Some(&sys_round("664fc")),
+            &[user_msg("q2 different tail")],
+            None,
+            8000,
+        );
+        assert!(
+            second.cache_read_input_tokens > 0,
+            "billing header nonce 变化不应破坏稳定前缀的缓存命中"
+        );
     }
 
     #[test]
