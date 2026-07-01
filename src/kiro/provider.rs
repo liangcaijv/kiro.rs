@@ -79,17 +79,20 @@ impl KiroProvider {
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
-        // 中转接口固定不走代理：聊天或 MCP 任一中转生效时即构建独立的无代理 Client
-        let relay_active = {
+        // 中转接口固定不走代理：只要中转基建（url/mcpUrl + apiKey）就绪即构建独立的无代理
+        // Client（不看全局 enabled）。这样即使全局默认关闭中转，个别账号仍可通过
+        // 账号级 useRelay=true 单独启用，无需重启。
+        let relay_infra_ready = {
             let relay = &token_manager.config().relay;
-            relay.is_active() || relay.is_mcp_active()
+            relay.has_chat_infra() || relay.has_mcp_infra()
         };
-        let relay_client = if relay_active {
+        let relay_client = if relay_infra_ready {
             match build_client(None, 720, tls_backend) {
                 Ok(c) => {
                     let relay = &token_manager.config().relay;
                     tracing::info!(
-                        "中转接口已启用 (聊天={}, WebSearch={})",
+                        "中转基建就绪 (全局默认={}, 聊天={}, WebSearch={})；可按账号级 useRelay 覆盖",
+                        if relay.enabled { "开" } else { "关" },
                         relay.url.as_deref().unwrap_or("未配置"),
                         relay.mcp_url.as_deref().unwrap_or("未配置"),
                     );
@@ -203,11 +206,18 @@ impl KiroProvider {
     ) -> Option<reqwest::Response> {
         let relay_client = self.relay_client.as_ref()?;
         let cfg = &rctx.config.relay;
-        if !cfg.is_active() {
+        // 账号级中转开关：useRelay 未设置时跟随全局 enabled
+        let want_relay = rctx.credentials.use_relay.unwrap_or(cfg.enabled);
+        if !want_relay {
             return None;
         }
-        let url = cfg.url.as_deref()?;
-        let api_key = cfg.api_key.as_deref()?;
+        // 基建必须就绪（url + apiKey）
+        let url = cfg.url.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+        let api_key = cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())?;
 
         // 与真实 Kiro 一致的请求头（复用 decorate_api），再追加 X-Api-Key
         let base = relay_client
@@ -262,11 +272,22 @@ impl KiroProvider {
     ) -> Option<reqwest::Response> {
         let relay_client = self.relay_client.as_ref()?;
         let cfg = &rctx.config.relay;
-        if !cfg.is_mcp_active() {
+        // 账号级中转开关：useRelay 未设置时跟随全局 enabled
+        let want_relay = rctx.credentials.use_relay.unwrap_or(cfg.enabled);
+        if !want_relay {
             return None;
         }
-        let url = cfg.mcp_url.as_deref()?;
-        let api_key = cfg.api_key.as_deref()?;
+        // 基建必须就绪（mcp_url + apiKey）
+        let url = cfg
+            .mcp_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())?;
+        let api_key = cfg
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())?;
 
         // 与真实 Kiro 一致的请求头（复用 decorate_mcp），再追加 X-Api-Key
         let base = relay_client

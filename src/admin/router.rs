@@ -2,14 +2,15 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        get_credential_balance, get_credential_detail, get_load_balancing_mode,
+        reset_failure_count, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, update_credential,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -19,6 +20,8 @@ use super::{
 /// # 端点
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials` - 添加新凭据
+/// - `GET /credentials/:id` - 获取凭据可编辑字段详情（编辑预填）
+/// - `PATCH /credentials/:id` - 编辑凭据（代理 / region / endpoint / email）
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
@@ -38,7 +41,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
-        .route("/credentials/{id}", delete(delete_credential))
+        .route(
+            "/credentials/{id}",
+            get(get_credential_detail)
+                .patch(update_credential)
+                .delete(delete_credential),
+        )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))

@@ -13,8 +13,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialDetailResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest, UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -87,6 +88,7 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                use_relay: entry.use_relay,
             })
             .collect();
 
@@ -236,6 +238,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            use_relay: None,  // 默认跟随全局中转配置
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
         };
@@ -274,6 +277,92 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(())
+    }
+
+    /// 获取凭据可编辑字段详情（用于编辑表单预填）
+    pub fn get_credential_detail(
+        &self,
+        id: u64,
+    ) -> Result<CredentialDetailResponse, AdminServiceError> {
+        let cred = self
+            .token_manager
+            .snapshot_credential(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+
+        Ok(CredentialDetailResponse {
+            id,
+            auth_method: cred.auth_method,
+            email: cred.email,
+            endpoint: cred.endpoint,
+            region: cred.region,
+            auth_region: cred.auth_region,
+            api_region: cred.api_region,
+            proxy_url: cred.proxy_url,
+            proxy_username: cred.proxy_username,
+            proxy_password: cred.proxy_password,
+            use_relay: cred.use_relay,
+        })
+    }
+
+    /// 编辑凭据（代理 / region / endpoint / email）
+    ///
+    /// PATCH 语义：字段缺省/`null` 保持原值，空字符串清除，非空值设置。
+    pub fn update_credential(
+        &self,
+        id: u64,
+        req: UpdateCredentialRequest,
+    ) -> Result<(), AdminServiceError> {
+        // 端点校验：设置为非空值时必须已注册
+        if let Some(ref ep) = req.endpoint {
+            let name = ep.trim();
+            if !name.is_empty() && !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+
+        // 代理 URL 校验：设置为非空值时校验协议（拦截 sockt5 之类拼写错误）
+        if let Some(ref pu) = req.proxy_url {
+            let url = pu.trim();
+            if !url.is_empty() {
+                validate_proxy_url(url).map_err(AdminServiceError::InvalidCredential)?;
+            }
+        }
+
+        // 中转开关校验：仅允许 follow/on/off（及等价写法）或空
+        let relay_patch = if let Some(ref v) = req.use_relay {
+            Some(parse_relay_switch(v).map_err(AdminServiceError::InvalidCredential)?)
+        } else {
+            None
+        };
+
+        self.token_manager
+            .update_credential(id, |c| {
+                apply_patch(&mut c.email, &req.email);
+                apply_patch(&mut c.endpoint, &req.endpoint);
+                apply_patch(&mut c.region, &req.region);
+                apply_patch(&mut c.auth_region, &req.auth_region);
+                apply_patch(&mut c.api_region, &req.api_region);
+                apply_patch(&mut c.proxy_url, &req.proxy_url);
+                apply_patch(&mut c.proxy_username, &req.proxy_username);
+                apply_patch(&mut c.proxy_password, &req.proxy_password);
+                // 不变量：没有代理 URL 时清除遗留的代理认证信息
+                if c.proxy_url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    c.proxy_url = None;
+                    c.proxy_username = None;
+                    c.proxy_password = None;
+                }
+                // 中转开关：Some(inner) 表示本次要改，inner 为三态目标值
+                if let Some(inner) = relay_patch {
+                    c.use_relay = inner;
+                }
+            })
+            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 获取负载均衡模式
@@ -464,5 +553,59 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+/// PATCH 语义应用：`None` 保持原值，`Some("")` 清除，`Some(非空)` 设置（trim 后写入）
+fn apply_patch(target: &mut Option<String>, patch: &Option<String>) {
+    if let Some(v) = patch {
+        let trimmed = v.trim();
+        *target = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+}
+
+/// 解析账号级中转开关字符串为三态目标值
+///
+/// - `"follow"` / `""` → `None`（跟随全局，清除账号级覆盖）
+/// - `"on"` / `"true"` / `"relay"` → `Some(true)`（走中转）
+/// - `"off"` / `"false"` / `"direct"` → `Some(false)`（直连）
+fn parse_relay_switch(value: &str) -> Result<Option<bool>, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "follow" | "global" | "default" => Ok(None),
+        "on" | "true" | "relay" | "1" => Ok(Some(true)),
+        "off" | "false" | "direct" | "0" => Ok(Some(false)),
+        other => Err(format!(
+            "无效的中转开关值: \"{}\"（可选：follow / on / off）",
+            other
+        )),
+    }
+}
+
+/// 校验代理 URL 协议，仅允许 http/https/socks5(h)，或特殊值 "direct"
+fn validate_proxy_url(url: &str) -> Result<(), String> {
+    // 特殊值 "direct" 表示显式不使用代理
+    if url.eq_ignore_ascii_case("direct") {
+        return Ok(());
+    }
+    let scheme = match url.split_once("://") {
+        Some((scheme, _)) => scheme.to_ascii_lowercase(),
+        None => {
+            return Err(format!(
+                "代理 URL 缺少协议前缀: \"{}\"（应形如 socks5://host:port）",
+                url
+            ));
+        }
+    };
+    if matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
+        Ok(())
+    } else {
+        Err(format!(
+            "代理 URL 协议无效: \"{}\"（仅支持 http/https/socks5，或特殊值 direct）",
+            scheme
+        ))
     }
 }

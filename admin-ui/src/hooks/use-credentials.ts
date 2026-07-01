@@ -8,10 +8,11 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
+  updateCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpdateCredentialRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -85,6 +86,19 @@ export function useAddCredential() {
     mutationFn: (req: AddCredentialRequest) => addCredential(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 编辑凭据（代理 / region / endpoint / email）
+export function useUpdateCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, req }: { id: number; req: UpdateCredentialRequest }) =>
+      updateCredential(id, req),
+    onSuccess: (_res, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-detail', id] })
     },
   })
 }

@@ -62,6 +62,9 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 账号级中转开关（None=跟随全局，true=走中转，false=直连）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_relay: Option<bool>,
 }
 
 // ============ 操作请求 ============
@@ -153,6 +156,99 @@ pub struct AddCredentialRequest {
 
 fn default_auth_method() -> String {
     "social".to_string()
+}
+
+// ============ 编辑凭据 ============
+
+/// 编辑凭据请求（PATCH 语义）
+///
+/// 每个字段的解释：
+/// - 缺省 / `null` → 保持原值不变
+/// - `""`（空字符串）→ 清除该字段（回退到全局/默认）
+/// - 非空值 → 设置为该值（自动 trim）
+///
+/// 仅覆盖运行时可安全修改的字段：代理、region、endpoint、email。
+/// 不含 token / 认证核心字段（如需修改请删除后重新添加）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialRequest {
+    /// 用户邮箱（显示名）
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// 端点名称（须为已注册端点；空字符串回退默认端点）
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// 凭据级 Region
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(default)]
+    pub auth_region: Option<String>,
+
+    /// 凭据级 API Region（用于 API 请求）
+    #[serde(default)]
+    pub api_region: Option<String>,
+
+    /// 凭据级代理 URL（支持 http/https/socks5，特殊值 "direct"）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+
+    /// 账号级中转开关（三态字符串）：
+    /// - 缺省 / `null` → 保持原值
+    /// - `"follow"` / `""` → 跟随全局（清除账号级覆盖）
+    /// - `"on"` / `"true"` → 走中转
+    /// - `"off"` / `"false"` → 直连
+    #[serde(default)]
+    pub use_relay: Option<String>,
+}
+
+/// 凭据可编辑字段详情（用于编辑表单预填，含代理机密回显）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialDetailResponse {
+    /// 凭据唯一 ID
+    pub id: u64,
+    /// 认证方式（用于前端展示，不可编辑）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    /// 用户邮箱
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// 端点名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 凭据级 Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// 凭据级 Auth Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// 凭据级 API Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    /// 凭据级代理 URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// 凭据级代理认证用户名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    /// 凭据级代理认证密码（明文回显，仅编辑预填用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    /// 账号级中转开关（None=跟随全局，true=走中转，false=直连）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_relay: Option<bool>,
 }
 
 /// 添加凭据成功响应

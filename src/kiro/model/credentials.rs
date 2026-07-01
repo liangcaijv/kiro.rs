@@ -113,6 +113,16 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 账号级中转开关（三态）
+    ///
+    /// - `None`（缺省）→ 跟随全局 `config.relay.enabled`
+    /// - `Some(true)` → 该账号走中转（前提：全局已配置中转 url + apiKey）
+    /// - `Some(false)` → 该账号强制直连（不走中转）
+    ///
+    /// 运行时可通过 Admin 编辑接口修改，无需重启。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_relay: Option<bool>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -402,6 +412,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            use_relay: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -523,6 +534,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            use_relay: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -557,6 +569,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            use_relay: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -674,6 +687,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            use_relay: None,
             kiro_api_key: None,
             endpoint: None,
         };

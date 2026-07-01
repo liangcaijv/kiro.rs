@@ -830,6 +830,9 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 账号级中转开关（None=跟随全局，true=走中转，false=直连）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_relay: Option<bool>,
 }
 
 /// 凭据管理器状态快照
@@ -1800,6 +1803,7 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    use_relay: e.credentials.use_relay,
                 })
                 .collect(),
             current_id,
@@ -1849,6 +1853,37 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 通用凭据字段更新（Admin API 编辑）
+    ///
+    /// 通过闭包就地修改指定凭据的字段，随后立即持久化。
+    /// 仅用于编辑代理 / region / endpoint / email 等运行时可安全变更的字段，
+    /// 不改变优先级选择与运行时统计。修改在下一次请求 / Token 刷新时自动生效。
+    pub fn update_credential<F>(&self, id: u64, edit: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut KiroCredentials),
+    {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            edit(&mut entry.credentials);
+        }
+        // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 读取指定凭据的完整信息克隆（Admin API 编辑预填）
+    pub fn snapshot_credential(&self, id: u64) -> Option<KiroCredentials> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
     }
 
     /// 重置凭据失败计数并重新启用（Admin API）

@@ -27,6 +27,8 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  // 账号级中转开关：undefined/null=跟随全局，true=走中转，false=直连
+  useRelay?: boolean | null
 }
 
 // 余额响应
@@ -90,4 +92,34 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+// 凭据可编辑字段详情（编辑表单预填，含代理机密回显）
+export interface CredentialDetail {
+  id: number
+  authMethod?: string
+  email?: string
+  endpoint?: string
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  // 账号级中转开关：undefined/null=跟随全局，true=走中转，false=直连
+  useRelay?: boolean | null
+}
+
+// 编辑凭据请求（PATCH 语义：字段空字符串=清除，非空=设置）
+export interface UpdateCredentialRequest {
+  email?: string
+  endpoint?: string
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  // 中转开关三态字符串：'follow' | 'on' | 'off'
+  useRelay?: string
 }

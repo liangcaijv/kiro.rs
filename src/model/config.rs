@@ -48,6 +48,10 @@ pub struct RelayConfig {
 
 impl RelayConfig {
     /// 聊天中转是否生效：enabled 且 url、api_key 均非空
+    ///
+    /// 账号级中转开关落地后，运行时判定改用 `has_chat_infra` + 账号级 `useRelay`，
+    /// 此方法保留用于测试与语义完整性。
+    #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         self.enabled
             && self.url.as_deref().is_some_and(|u| !u.trim().is_empty())
@@ -55,9 +59,25 @@ impl RelayConfig {
     }
 
     /// MCP/WebSearch 中转是否生效：enabled 且 mcp_url、api_key 均非空
+    #[allow(dead_code)]
     pub fn is_mcp_active(&self) -> bool {
         self.enabled
             && self.mcp_url.as_deref().is_some_and(|u| !u.trim().is_empty())
+            && self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+    }
+
+    /// 聊天中转基础设施是否就绪：url、api_key 均非空（**不看 enabled**）
+    ///
+    /// 用于账号级中转开关：即使全局 `enabled=false`，只要基建就绪，
+    /// 个别账号仍可通过 `useRelay=true` 单独启用中转。
+    pub fn has_chat_infra(&self) -> bool {
+        self.url.as_deref().is_some_and(|u| !u.trim().is_empty())
+            && self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+    }
+
+    /// MCP/WebSearch 中转基础设施是否就绪：mcp_url、api_key 均非空（**不看 enabled**）
+    pub fn has_mcp_infra(&self) -> bool {
+        self.mcp_url.as_deref().is_some_and(|u| !u.trim().is_empty())
             && self.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
     }
 }

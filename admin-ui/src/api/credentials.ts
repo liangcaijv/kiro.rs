@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CredentialDetail,
+  UpdateCredentialRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -90,6 +92,21 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+// 获取凭据可编辑字段详情（编辑预填）
+export async function getCredentialDetail(id: number): Promise<CredentialDetail> {
+  const { data } = await api.get<CredentialDetail>(`/credentials/${id}`)
+  return data
+}
+
+// 编辑凭据（代理 / region / endpoint / email）
+export async function updateCredential(
+  id: number,
+  req: UpdateCredentialRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.patch<SuccessResponse>(`/credentials/${id}`, req)
   return data
 }
 
