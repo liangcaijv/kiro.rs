@@ -66,9 +66,13 @@ export interface SetPriorityRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   clientId?: string
   clientSecret?: string
+  // 外部 IdP（external_idp / Microsoft Entra ID）刷新所需
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   priority?: number
   authRegion?: string
   apiRegion?: string

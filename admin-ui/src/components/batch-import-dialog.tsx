@@ -22,6 +22,10 @@ interface CredentialInput {
   refreshToken?: string
   clientId?: string
   clientSecret?: string
+  // 外部 IdP（external_idp / Microsoft Entra ID）
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -266,11 +270,32 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+          const issuerUrl = cred.issuerUrl?.trim() || undefined
+          const scopes = cred.scopes?.trim() || undefined
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
-            throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          // 识别外部 IdP（external_idp / Microsoft Entra ID）：
+          // 显式 authMethod，或「有 tokenEndpoint 且无 clientSecret」（public client + PKCE）。
+          const declaredMethod = cred.authMethod?.trim().toLowerCase()
+          const isExternalIdp =
+            declaredMethod === 'external_idp' ||
+            declaredMethod === 'external-idp' ||
+            declaredMethod === 'externalidp' ||
+            (!!tokenEndpoint && !clientSecret)
+
+          let authMethod: 'social' | 'idc' | 'external_idp'
+          if (isExternalIdp) {
+            // 外部 IdP 只需 clientId + tokenEndpoint（+ refreshToken），不需要 clientSecret
+            if (!clientId || !tokenEndpoint) {
+              throw new Error('external_idp 模式需要同时提供 clientId 和 tokenEndpoint')
+            }
+            authMethod = 'external_idp'
+          } else {
+            authMethod = clientId && clientSecret ? 'idc' : 'social'
+            // idc 模式下必须同时提供 clientId 和 clientSecret
+            if (authMethod === 'social' && (clientId || clientSecret)) {
+              throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+            }
           }
 
           const addedCred = await addCredential({
@@ -279,7 +304,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
-            clientSecret,
+            clientSecret: authMethod === 'external_idp' ? undefined : clientSecret,
+            tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint : undefined,
+            issuerUrl: authMethod === 'external_idp' ? issuerUrl : undefined,
+            scopes: authMethod === 'external_idp' ? scopes : undefined,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
@@ -422,7 +450,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nExternal IdP (M365/Entra): [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

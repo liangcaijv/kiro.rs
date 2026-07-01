@@ -15,7 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -45,6 +45,12 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 已尝试过 profileArn 解析的凭据 ID（进程内去重）。
+    ///
+    /// 避免对「无组织 profile」的 external_idp 账号在每次请求都重复调用
+    /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，
+    /// 之后 `credentials.profile_arn` 直接命中，不再进入解析路径。
+    profile_resolution_attempted: Mutex<HashSet<u64>>,
 }
 
 impl KiroProvider {
@@ -68,8 +74,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -106,6 +112,53 @@ impl KiroProvider {
             relay_client,
             endpoints,
             default_endpoint,
+            profile_resolution_attempted: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// 在发起请求前，确保 external_idp 账号的真实 profileArn 已解析并写入 `ctx`。
+    ///
+    /// 仅对「external_idp 凭据 + profileArn 缺失」触发一次上游 `ListAvailableProfiles`
+    /// 查询（进程内去重）：
+    /// - 命中真实 ARN → 写回 `ctx.credentials.profile_arn` 并由 token_manager 持久化；
+    /// - 上游确认无组织 profile → 标记已尝试，后续请求不再重复查询；
+    /// - 网络/瞬态错误 → 不标记，下次再试；本次按原（无）profileArn 继续，行为不退化。
+    async fn ensure_profile_arn(&self, ctx: &mut CallContext) {
+        if !ctx.credentials.is_external_idp() {
+            return;
+        }
+        let has_arn = ctx
+            .credentials
+            .profile_arn
+            .as_deref()
+            .map(|a| !a.trim().is_empty())
+            .unwrap_or(false);
+        if has_arn {
+            return;
+        }
+        if self.profile_resolution_attempted.lock().contains(&ctx.id) {
+            return;
+        }
+        match self
+            .token_manager
+            .resolve_profile_arn_for(ctx.id, &ctx.token)
+            .await
+        {
+            Ok(Some(arn)) => {
+                ctx.credentials.profile_arn = Some(arn);
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Ok(None) => {
+                // 上游确认无组织 profile：标记已尝试，避免每次请求重复查询
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}",
+                    ctx.id,
+                    e
+                );
+            }
         }
     }
 
@@ -122,10 +175,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -171,11 +221,7 @@ impl KiroProvider {
 
         match request.send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!(
-                    "[渠道=中转] 请求成功 (凭据 #{}, url={})",
-                    cred_id,
-                    url
-                );
+                tracing::info!("[渠道=中转] 请求成功 (凭据 #{}, url={})", cred_id, url);
                 Some(resp)
             }
             Ok(resp) => {
@@ -288,13 +334,16 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // external_idp 账号：懒解析并回填真实 profileArn（best-effort，失败不阻断）
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -384,7 +433,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -454,13 +508,16 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // external_idp 账号：懒解析并回填真实 profileArn（best-effort，失败不阻断）
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -578,7 +635,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }

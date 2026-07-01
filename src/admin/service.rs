@@ -222,6 +222,9 @@ impl AdminService {
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,
@@ -429,7 +432,14 @@ impl AdminService {
             || msg.contains("kiroApiKey 为空")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
-            || msg.contains("已被限流");
+            || msg.contains("已被限流")
+            // external_idp 配置/校验失败
+            || msg.contains("external IdP 刷新需要")
+            || msg.contains("token_endpoint 必须是 https")
+            || msg.contains("token_endpoint 不允许")
+            || msg.contains("token_endpoint 主机不在白名单")
+            || msg.contains("token_endpoint 缺少主机")
+            || msg.contains("请求参数错误或 refreshToken 无效");
 
         if is_invalid_credential {
             AdminServiceError::InvalidCredential(msg)
@@ -448,7 +458,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

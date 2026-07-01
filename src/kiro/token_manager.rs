@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,9 +18,11 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -119,16 +121,29 @@ pub(crate) async fn refresh_token(
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
-    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
+    // 如果未指定 auth_method，根据字段自动判断：
+    // - 有 tokenEndpoint + clientId 且无 clientSecret → external_idp（public client + PKCE）
+    // - 有 clientId + clientSecret → idc
+    // - 否则 → social
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
+        if credentials.token_endpoint.is_some()
+            && credentials.client_id.is_some()
+            && credentials.client_secret.is_none()
+        {
+            "external_idp"
+        } else if credentials.client_id.is_some() && credentials.client_secret.is_some() {
             "idc"
         } else {
             "social"
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp")
+        || auth_method.eq_ignore_ascii_case("external-idp")
+        || auth_method.eq_ignore_ascii_case("externalidp")
+    {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -319,6 +334,199 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 外部 IdP 可信 Token 端点主机白名单（防 SSRF / 开放重定向）。
+///
+/// 后缀白名单覆盖各国 Microsoft 登录云；额外允许几个历史/别名精确主机。
+/// 保持保守：只放行 Microsoft 身份平台，绝不放行任意主机。
+const EXTERNAL_IDP_ALLOWED_HOST_SUFFIXES: &[&str] = &[
+    ".microsoftonline.com",
+    ".microsoftonline.us",
+    ".microsoftonline.cn",
+];
+
+/// 允许的精确主机（非 `*.microsoftonline.*` 形态的 Microsoft 登录域）。
+const EXTERNAL_IDP_ALLOWED_HOSTS: &[&str] = &["login.microsoft.com", "login.windows.net"];
+
+/// 校验外部 IdP token_endpoint：必须 https + 主机在白名单内，拒绝 userinfo / IP。
+///
+/// 手动解析 scheme/authority，不引入额外 url crate 依赖。
+fn validate_external_idp_endpoint(raw_url: &str) -> anyhow::Result<()> {
+    let trimmed = raw_url.trim();
+
+    // 仅允许 https（大小写不敏感）
+    let rest = trimmed
+        .get(..8)
+        .filter(|p| p.eq_ignore_ascii_case("https://"))
+        .map(|_| &trimmed[8..])
+        .ok_or_else(|| anyhow::anyhow!("external IdP token_endpoint 必须是 https: {}", raw_url))?;
+
+    // authority = scheme 后到第一个 '/'、'?'、'#' 之前的部分
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+
+    // 拒绝 userinfo（防止 https://evil.com@login.microsoftonline.com/... 这类绕过）
+    if authority.contains('@') {
+        bail!(
+            "external IdP token_endpoint 不允许包含 userinfo: {}",
+            raw_url
+        );
+    }
+
+    // 去掉端口后取主机
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+        .trim_matches(['[', ']']) // 去掉 IPv6 字面量括号
+        .to_ascii_lowercase();
+
+    if host.is_empty() {
+        bail!("external IdP token_endpoint 缺少主机: {}", raw_url);
+    }
+
+    // 拒绝 IP 字面量（IPv4 / IPv6），杜绝内网/localhost 直连
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        bail!("external IdP token_endpoint 不允许使用 IP: {}", host);
+    }
+    // 拒绝 localhost
+    if host == "localhost" || host.ends_with(".localhost") {
+        bail!("external IdP token_endpoint 不允许使用 localhost: {}", host);
+    }
+
+    let allowed = EXTERNAL_IDP_ALLOWED_HOSTS.contains(&host.as_str())
+        || EXTERNAL_IDP_ALLOWED_HOST_SUFFIXES
+            .iter()
+            .any(|suffix| host.ends_with(suffix));
+
+    if allowed {
+        Ok(())
+    } else {
+        bail!("external IdP token_endpoint 主机不在白名单: {}", host)
+    }
+}
+
+/// 构建 external_idp 刷新的 form-urlencoded 表单字段。
+///
+/// 仅包含 `client_id` / `grant_type` / `refresh_token` /（可选）`scope`，
+/// **绝不发送 client_secret**（public client + PKCE）。抽成纯函数便于单测。
+fn build_external_idp_refresh_form<'a>(
+    client_id: &'a str,
+    refresh_token: &'a str,
+    scopes: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    if let Some(scope) = scopes {
+        if !scope.trim().is_empty() {
+            form.push(("scope", scope));
+        }
+    }
+    form
+}
+
+/// 刷新外部 IdP Token（external_idp / Microsoft Entra ID / Azure AD）
+///
+/// external_idp 是 public client + PKCE 登录：刷新直接 POST 凭据自带的
+/// `token_endpoint`（如 `login.microsoftonline.com/{tenant}/oauth2/v2.0/token`），
+/// 用 `client_id + refresh_token`（+ 可选 `scope`），**无 client_secret**。
+/// 响应为 Microsoft snake_case；若未返回新 refresh_token 则保留旧值；profile_arn 不变。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 external IdP (Microsoft Entra) Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external IdP 刷新需要 tokenEndpoint"))?;
+
+    // 防 SSRF：主机白名单校验
+    validate_external_idp_endpoint(token_endpoint)?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let form =
+        build_external_idp_refresh_form(client_id, refresh_token, credentials.scopes.as_deref());
+
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        // invalid_grant → refreshToken 永久失效（被撤销/过期），按永久失效处理
+        if (status.as_u16() == 400 || status.as_u16() == 401) && body_text.contains("invalid_grant")
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "external IdP refreshToken 已失效 (invalid_grant): {}",
+                    body_text
+                ),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            400 => "external IdP 请求参数错误或 refreshToken 无效",
+            401 => "external IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，Microsoft 身份服务暂时不可用",
+            _ => "external IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    // 边缘情况：2xx 但携带 error（正常错误走非 2xx 分支，这里防御性处理）
+    if let Some(err) = data.error.as_deref() {
+        if err == "invalid_grant" {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "external IdP refreshToken 已失效 (invalid_grant): {}",
+                    data.error_description.as_deref().unwrap_or("")
+                ),
+            }
+            .into());
+        }
+        bail!(
+            "external IdP Token 刷新失败: {} {}",
+            err,
+            data.error_description.as_deref().unwrap_or("")
+        );
+    }
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+    // 若未返回新的 refresh_token，保留旧 refreshToken
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+    // external_idp 刷新不返回 profileArn，保持原值不变（真实 ARN 由 ListAvailableProfiles 懒解析）。
+    Ok(new_credentials)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -352,10 +560,7 @@ pub(crate) async fn get_usage_limits(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -369,8 +574,9 @@ pub(crate) async fn get_usage_limits(
         .header("Authorization", format!("Bearer {}", token))
         .header("Connection", "close");
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+    // external_idp → tokentype: EXTERNAL_IDP；api_key → tokentype: API_KEY
+    if let Some(token_type) = credentials.token_type_header() {
+        request = request.header("tokentype", token_type);
     }
 
     let response = request.send().await?;
@@ -390,6 +596,143 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+/// 组织 SSO 账号可用的真实 profileArn 端点候选区域。
+///
+/// 官方 Kiro `ListAvailableProfiles`（同用量 REST 接口）仅在 `us-east-1` /
+/// `eu-central-1` 提供服务。以凭据 API region 为主，附带两个官方端点作为回退，
+/// 去重后返回，最大化命中真实 profile 的概率。
+fn list_profiles_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |region: &str| {
+        if !region.is_empty() && !candidates.iter().any(|c| c == region) {
+            candidates.push(region.to_string());
+        }
+    };
+    push(credentials.effective_api_region(config));
+    push("us-east-1");
+    push("eu-central-1");
+    candidates
+}
+
+/// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
+///
+/// 组织 SSO（external_idp / Enterprise / IdC）账号必须用真实 profileArn 调用数据面；
+/// 该 ARN 不在刷新响应里返回，只能通过本接口获取。
+///
+/// 上游接口（AWS JSON 1.0，**与用量类的 REST GET 不同**）：
+/// `POST https://q.{region}.amazonaws.com/`，请求头
+/// `x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles`，
+/// `Content-Type: application/x-amz-json-1.0`，Body `{"maxResults":N}`。
+///
+/// 遍历所有候选区域并按 ARN 合并去重（同一账号可能在不同区域返回不同 profile）。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    tracing::debug!("正在获取可用 profile 列表 (ListAvailableProfiles)...");
+
+    let candidates = list_profiles_region_candidates(credentials, config);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut last_error: Option<String> = None;
+    let mut successful_empty_seen = false;
+    let mut merged_profiles = Vec::new();
+    let mut seen_arns: HashSet<String> = HashSet::new();
+
+    for region in &candidates {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!("https://{}/", host);
+
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.ListAvailableProfiles",
+            )
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .body(r#"{"maxResults":10}"#);
+
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
+        }
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = Some(e.to_string());
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let data: ListAvailableProfilesResponse = response.json().await?;
+            if data.first_arn().is_none() {
+                successful_empty_seen = true;
+            }
+            for profile in data.profiles {
+                let Some(arn) = profile
+                    .arn
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|arn| !arn.is_empty())
+                else {
+                    continue;
+                };
+                if seen_arns.insert(arn.to_string()) {
+                    merged_profiles.push(profile);
+                }
+            }
+            continue;
+        }
+
+        let body_text = response.text().await.unwrap_or_default();
+        last_error = Some(format!("{} {}", status, body_text));
+        tracing::debug!(
+            "ListAvailableProfiles 在 {} 返回 {}，继续尝试其它候选端点",
+            region,
+            last_error.as_deref().unwrap_or_default()
+        );
+    }
+
+    if !merged_profiles.is_empty() {
+        return Ok(ListAvailableProfilesResponse {
+            profiles: merged_profiles,
+            next_token: None,
+        });
+    }
+
+    // 至少有一次成功但为空：视为"该账号无组织 profile"，返回空结果（调用方保持 None）。
+    if successful_empty_seen {
+        return Ok(ListAvailableProfilesResponse::default());
+    }
+
+    bail!(
+        "获取可用 profile 失败: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    )
 }
 
 // ============================================================================
@@ -832,14 +1175,13 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1411,7 +1753,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -1445,14 +1788,17 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                            DisabledReason::InvalidConfig => "InvalidConfig",
+                        }
+                        .to_string()
+                    }),
                     endpoint: e.credentials.endpoint.clone(),
                 })
                 .collect(),
@@ -1514,10 +1860,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -1527,6 +1870,67 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 解析并回填组织 SSO（external_idp）账号的真实 profileArn。
+    ///
+    /// external_idp 刷新不返回 profileArn，也不能填 Builder ID 占位 ARN（会 403）。
+    /// 数据面（尤其流式 `generateAssistantResponse`）要求真实 profileArn，只能通过
+    /// `ListAvailableProfiles` 懒解析获取。
+    ///
+    /// 行为：
+    /// - 非 external_idp / 已有 profileArn → 直接返回，不发起网络请求；
+    /// - 否则调用上游 `ListAvailableProfiles`，命中真实 ARN 时写回凭据并持久化；
+    /// - 上游确认无组织 profile → 返回 `Ok(None)`，调用方保持无 profileArn 行为。
+    ///
+    /// 返回本次应使用的 profileArn（`Some` 表示真实 ARN）。
+    pub async fn resolve_profile_arn_for(
+        &self,
+        id: u64,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // 仅 external_idp 且缺 profileArn 才需要解析
+        if !credentials.is_external_idp() {
+            return Ok(credentials.profile_arn.clone());
+        }
+        if let Some(arn) = credentials.profile_arn.as_deref() {
+            if !arn.trim().is_empty() {
+                return Ok(Some(arn.to_string()));
+            }
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let profiles =
+            list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
+                .await?;
+
+        let Some(arn) = profiles.first_arn().map(|s| s.to_string()) else {
+            // 上游确认无组织 profile：保持无 profileArn 行为
+            return Ok(None);
+        };
+
+        // 写回真实 ARN 并持久化
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.profile_arn = Some(arn.clone());
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", e);
+        }
+        tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+
+        Ok(Some(arn))
     }
 
     /// 获取指定凭据的使用额度（Admin API）
@@ -1602,7 +2006,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1611,8 +2016,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1736,6 +2140,9 @@ impl MultiTokenManager {
         });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
@@ -1852,8 +2259,7 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2072,11 +2478,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2090,11 +2498,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2108,11 +2518,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2277,21 +2689,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2334,7 +2739,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -2395,7 +2801,12 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2435,7 +2846,12 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2595,5 +3011,178 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============ external_idp (Microsoft Entra / Azure AD) 测试 ============
+
+    #[test]
+    fn test_validate_external_idp_endpoint_accepts_microsoft() {
+        for url in [
+            "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token",
+            "https://login.microsoftonline.us/t/oauth2/v2.0/token",
+            "https://login.microsoftonline.cn/t/oauth2/v2.0/token",
+            "https://login.microsoft.com/t/oauth2/v2.0/token",
+            "https://login.windows.net/t/oauth2/v2.0/token",
+            // scheme 大小写不敏感
+            "HTTPS://login.microsoftonline.com/t/oauth2/v2.0/token",
+        ] {
+            assert!(
+                validate_external_idp_endpoint(url).is_ok(),
+                "应接受: {}",
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_external_idp_endpoint_rejects_bad_hosts() {
+        for url in [
+            // 非 https
+            "http://login.microsoftonline.com/t/oauth2/v2.0/token",
+            // 非白名单主机
+            "https://evil.example.com/token",
+            // userinfo 绕过
+            "https://evil.com@login.microsoftonline.com/token",
+            // 后缀拼接绕过（不是真正的 microsoftonline.com）
+            "https://login.microsoftonline.com.evil.com/token",
+            // 前缀伪装
+            "https://evilmicrosoftonline.com/token",
+            // IP 字面量
+            "https://10.0.0.1/token",
+            "https://[::1]/token",
+            // localhost / 内网
+            "https://localhost/token",
+            "https://foo.localhost/token",
+        ] {
+            assert!(
+                validate_external_idp_endpoint(url).is_err(),
+                "应拒绝: {}",
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn test_external_idp_refresh_form_omits_client_secret() {
+        let form = build_external_idp_refresh_form(
+            "client-id",
+            "refresh-token",
+            Some("api://x/codewhisperer:completions offline_access"),
+        );
+        // 断言字段集合与顺序（form-urlencoded）
+        assert_eq!(
+            form,
+            vec![
+                ("client_id", "client-id"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "refresh-token"),
+                ("scope", "api://x/codewhisperer:completions offline_access"),
+            ]
+        );
+        // 绝不包含 client_secret
+        assert!(!form.iter().any(|(k, _)| *k == "client_secret"));
+    }
+
+    #[test]
+    fn test_external_idp_refresh_form_scope_optional() {
+        // 无 scope / 空白 scope 时不发送 scope 字段
+        let form = build_external_idp_refresh_form("cid", "rt", None);
+        assert_eq!(
+            form,
+            vec![
+                ("client_id", "cid"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "rt"),
+            ]
+        );
+        let form_blank = build_external_idp_refresh_form("cid", "rt", Some("   "));
+        assert!(!form_blank.iter().any(|(k, _)| *k == "scope"));
+    }
+
+    #[test]
+    fn test_refresh_routing_infers_external_idp_by_token_endpoint() {
+        // 有 tokenEndpoint + clientId、无 clientSecret、无 auth_method → 推断 external_idp
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(120));
+        cred.client_id = Some("cid".to_string());
+        cred.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+
+        let auth_method = cred.auth_method.as_deref().unwrap_or_else(|| {
+            if cred.token_endpoint.is_some()
+                && cred.client_id.is_some()
+                && cred.client_secret.is_none()
+            {
+                "external_idp"
+            } else if cred.client_id.is_some() && cred.client_secret.is_some() {
+                "idc"
+            } else {
+                "social"
+            }
+        });
+        assert_eq!(auth_method, "external_idp");
+    }
+
+    #[test]
+    fn test_refresh_routing_not_external_idp_when_client_secret_present() {
+        // 有 clientSecret（idc）→ 不推断为 external_idp，即使带 tokenEndpoint
+        let mut cred = KiroCredentials::default();
+        cred.client_id = Some("cid".to_string());
+        cred.client_secret = Some("secret".to_string());
+        cred.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+
+        let auth_method = cred.auth_method.as_deref().unwrap_or_else(|| {
+            if cred.token_endpoint.is_some()
+                && cred.client_id.is_some()
+                && cred.client_secret.is_none()
+            {
+                "external_idp"
+            } else if cred.client_id.is_some() && cred.client_secret.is_some() {
+                "idc"
+            } else {
+                "social"
+            }
+        });
+        assert_eq!(auth_method, "idc");
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_preserves_old_refresh_token() {
+        // 响应无 refresh_token 时应保留旧值；有则替换
+        let old = "old-refresh-token";
+
+        let no_rt: ExternalIdpRefreshResponse =
+            serde_json::from_str(r#"{"access_token":"new-at","expires_in":3600}"#).unwrap();
+        let effective = no_rt
+            .refresh_token
+            .clone()
+            .unwrap_or_else(|| old.to_string());
+        assert_eq!(effective, old);
+        assert_eq!(no_rt.access_token, "new-at");
+
+        let with_rt: ExternalIdpRefreshResponse = serde_json::from_str(
+            r#"{"access_token":"new-at","refresh_token":"rotated","expires_in":3600}"#,
+        )
+        .unwrap();
+        let effective2 = with_rt
+            .refresh_token
+            .clone()
+            .unwrap_or_else(|| old.to_string());
+        assert_eq!(effective2, "rotated");
+    }
+
+    #[test]
+    fn test_external_idp_error_response_parses_invalid_grant() {
+        // Microsoft 的 invalid_grant 错误体（snake_case）能被识别
+        let err: ExternalIdpRefreshResponse = serde_json::from_str(
+            r#"{"access_token":"","error":"invalid_grant","error_description":"AADSTS700082: expired"}"#,
+        )
+        .unwrap();
+        assert_eq!(err.error.as_deref(), Some("invalid_grant"));
+        assert_eq!(
+            err.error_description.as_deref(),
+            Some("AADSTS700082: expired")
+        );
     }
 }

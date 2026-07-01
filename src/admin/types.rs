@@ -89,15 +89,27 @@ pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
-    /// 认证方式（可选，默认 social）
+    /// 认证方式（可选，默认 social）。支持 social / idc / api_key / external_idp
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
-    /// OIDC Client ID（IdC 认证需要）
+    /// OIDC Client ID（IdC / external_idp 认证需要）
     pub client_id: Option<String>,
 
-    /// OIDC Client Secret（IdC 认证需要）
+    /// OIDC Client Secret（IdC 认证需要；external_idp 不需要）
     pub client_secret: Option<String>,
+
+    /// 外部 IdP Token 端点（external_idp / Microsoft Entra 刷新需要）
+    #[serde(default, alias = "token_endpoint")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP Issuer URL（external_idp，可选，仅记录）
+    #[serde(default, alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 刷新 scope（external_idp 需要）
+    #[serde(default)]
+    pub scopes: Option<String>,
 
     /// 优先级（可选，默认 0）
     #[serde(default)]

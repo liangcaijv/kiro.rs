@@ -81,8 +81,9 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        // external_idp → tokentype: EXTERNAL_IDP；api_key → tokentype: API_KEY；其余不发送
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }
@@ -99,8 +100,9 @@ impl KiroEndpoint for IdeEndpoint {
         if let Some(ref arn) = ctx.credentials.profile_arn {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        // external_idp → tokentype: EXTERNAL_IDP；api_key → tokentype: API_KEY；其余不发送
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }
@@ -126,7 +128,50 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::inject_profile_arn;
+    use super::{IdeEndpoint, KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
     use serde_json::Value;
+
+    fn tokentype_header_for(creds: &KiroCredentials) -> Option<String> {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: creds,
+            token: "tok",
+            machine_id: "m",
+            config: &config,
+        };
+        let base = reqwest::Client::new().post("https://example.invalid/");
+        let req = endpoint.decorate_api(base, &ctx).build().unwrap();
+        req.headers()
+            .get("tokentype")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn test_decorate_api_external_idp_sets_tokentype() {
+        let mut creds = KiroCredentials::default();
+        creds.auth_method = Some("external_idp".to_string());
+        assert_eq!(
+            tokentype_header_for(&creds),
+            Some("EXTERNAL_IDP".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decorate_api_api_key_sets_tokentype() {
+        let mut creds = KiroCredentials::default();
+        creds.kiro_api_key = Some("ksk_x".to_string());
+        assert_eq!(tokentype_header_for(&creds), Some("API_KEY".to_string()));
+    }
+
+    #[test]
+    fn test_decorate_api_social_omits_tokentype() {
+        let mut creds = KiroCredentials::default();
+        creds.auth_method = Some("social".to_string());
+        assert_eq!(tokentype_header_for(&creds), None);
+    }
 
     #[test]
     fn test_inject_profile_arn_with_some() {

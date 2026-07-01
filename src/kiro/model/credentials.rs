@@ -46,6 +46,22 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// 外部 IdP (external_idp / M365 / Entra ID) Token 端点。
+    ///
+    /// external_idp 是 public client + PKCE 登录：刷新时直接 POST 这个 token_endpoint
+    /// （如 `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`），
+    /// 用 client_id + refresh_token，**无 client_secret**。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP Issuer URL（external_idp，仅记录用途，刷新流程不依赖）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 刷新 scope（external_idp 需要，刷新时原样回传）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -121,6 +137,10 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("externalidp")
+    {
+        "external_idp"
     } else {
         value
     }
@@ -272,6 +292,44 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 是否为外部 IdP（external_idp / M365 / Entra ID）登录。
+    ///
+    /// 识别依据（任一成立）：
+    /// - `auth_method` 为 `external_idp`（含 `external-idp` / `externalidp` 变体）；
+    /// - 未显式声明 auth_method，但存在 `token_endpoint` + `client_id` 且无 `client_secret`
+    ///   （public client + PKCE 的形态，不会被误判为 social 或 idc）。
+    pub fn is_external_idp(&self) -> bool {
+        if let Some(m) = self.auth_method.as_deref() {
+            if m.eq_ignore_ascii_case("external_idp")
+                || m.eq_ignore_ascii_case("external-idp")
+                || m.eq_ignore_ascii_case("externalidp")
+            {
+                return true;
+            }
+            // 显式声明了其它 auth_method（social/idc/api_key 等）时不再推断
+            if !m.trim().is_empty() {
+                return false;
+            }
+        }
+        self.token_endpoint.is_some() && self.client_id.is_some() && self.client_secret.is_none()
+    }
+
+    /// 该凭据调用 CodeWhisperer / Kiro 数据面与管理面时应发送的 `tokentype` header 值。
+    ///
+    /// - API Key 凭据 → `API_KEY`
+    /// - 外部 IdP（M365/Entra）→ `EXTERNAL_IDP`（缺失会被上游以 403 "bearer token
+    ///   invalid" / 400 "Invalid token" 拒绝）
+    /// - 其余（social / idc / builder-id）→ 不发送
+    pub fn token_type_header(&self) -> Option<&'static str> {
+        if self.is_api_key_credential() {
+            Some("API_KEY")
+        } else if self.is_external_idp() {
+            Some("EXTERNAL_IDP")
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +388,9 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -448,6 +509,9 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -479,6 +543,9 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -593,6 +660,9 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,
@@ -869,5 +939,113 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ============ external_idp (Microsoft Entra / Azure AD) 测试 ============
+
+    #[test]
+    fn test_external_idp_credential_roundtrip() {
+        // 组织 SSO 导出的 JSON 能被正确反序列化（含 tokenEndpoint/issuerUrl/scopes，无 clientSecret）
+        let json = r#"{
+            "authMethod": "external_idp",
+            "accessToken": "a",
+            "refreshToken": "r",
+            "expiresAt": "2026-01-01T00:00:00Z",
+            "clientId": "cid",
+            "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+            "scopes": "api://x/codewhisperer:conversations offline_access"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tenant/v2.0")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some("api://x/codewhisperer:conversations offline_access")
+        );
+        assert_eq!(creds.client_id.as_deref(), Some("cid"));
+        assert!(creds.client_secret.is_none());
+
+        // 往返序列化保持字段（camelCase）
+        let out = creds.to_pretty_json().unwrap();
+        assert!(out.contains("tokenEndpoint"));
+        assert!(out.contains("issuerUrl"));
+        assert!(out.contains("scopes"));
+        assert!(!out.contains("clientSecret"));
+    }
+
+    #[test]
+    fn test_is_external_idp_by_auth_method() {
+        let mut creds = KiroCredentials::default();
+        creds.auth_method = Some("external_idp".to_string());
+        assert!(creds.is_external_idp());
+
+        // 变体大小写 / 连字符
+        creds.auth_method = Some("External-IDP".to_string());
+        assert!(creds.is_external_idp());
+        creds.auth_method = Some("externalidp".to_string());
+        assert!(creds.is_external_idp());
+    }
+
+    #[test]
+    fn test_is_external_idp_inferred_by_token_endpoint_without_secret() {
+        // tokenEndpoint + clientId 且无 clientSecret → 推断为 external_idp（不误判 social/idc）
+        let mut creds = KiroCredentials::default();
+        creds.client_id = Some("cid".to_string());
+        creds.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        assert!(creds.is_external_idp());
+    }
+
+    #[test]
+    fn test_not_external_idp_when_idc_or_social() {
+        // idc：clientId + clientSecret → 不是 external_idp
+        let mut idc = KiroCredentials::default();
+        idc.client_id = Some("cid".to_string());
+        idc.client_secret = Some("secret".to_string());
+        idc.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        assert!(!idc.is_external_idp());
+
+        // 显式 social → 不是 external_idp，即使有 tokenEndpoint
+        let mut social = KiroCredentials::default();
+        social.auth_method = Some("social".to_string());
+        social.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        social.client_id = Some("cid".to_string());
+        assert!(!social.is_external_idp());
+
+        // 纯 social（无任何 external 线索）
+        let plain = KiroCredentials::default();
+        assert!(!plain.is_external_idp());
+    }
+
+    #[test]
+    fn test_token_type_header_variants() {
+        // external_idp → EXTERNAL_IDP
+        let mut ext = KiroCredentials::default();
+        ext.auth_method = Some("external_idp".to_string());
+        assert_eq!(ext.token_type_header(), Some("EXTERNAL_IDP"));
+
+        // api_key → API_KEY
+        let mut api = KiroCredentials::default();
+        api.kiro_api_key = Some("ksk_x".to_string());
+        assert_eq!(api.token_type_header(), Some("API_KEY"));
+
+        // social / idc → 不发送
+        let social = KiroCredentials::default();
+        assert_eq!(social.token_type_header(), None);
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.client_id = Some("c".to_string());
+        idc.client_secret = Some("s".to_string());
+        assert_eq!(idc.token_type_header(), None);
     }
 }
