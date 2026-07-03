@@ -146,7 +146,7 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
 }
 
 /// 生成22位大小写字母和数字的随机字符串
-fn generate_random_id_22() -> String {
+pub(super) fn generate_random_id_22() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     (0..22)
         .map(|_| {
@@ -157,7 +157,7 @@ fn generate_random_id_22() -> String {
 }
 
 /// 生成8位小写字母和数字的随机字符串
-fn generate_random_id_8() -> String {
+pub(super) fn generate_random_id_8() -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     (0..8)
         .map(|_| {

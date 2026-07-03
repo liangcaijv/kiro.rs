@@ -26,6 +26,7 @@ use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::webfetch;
 use super::websearch;
 
 /// 构造模拟缓存的隔离标识：`model | user_id`，防止跨模型/会话串味。
@@ -282,6 +283,38 @@ pub async fn post_messages(
         };
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
+    }
+
+    // 检查是否为 WebFetch 请求
+    if webfetch::has_web_fetch_tool(&payload) {
+        tracing::info!("检测到 WebFetch 工具，路由到 WebFetch 处理");
+
+        // 估算输入 tokens
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        let cache_split = if state.simulate_cache {
+            Some(
+                cache_sim::compute_split(
+                    &cache_scope_key(&payload),
+                    &payload.model,
+                    payload.cache_control.as_ref(),
+                    payload.system.as_deref(),
+                    &payload.messages,
+                    payload.tools.as_deref(),
+                    input_tokens,
+                )
+                .dampen_read(state.simulate_cache_read_factor),
+            )
+        } else {
+            None
+        };
+
+        return webfetch::handle_webfetch_request(provider, &payload, input_tokens, cache_split).await;
     }
 
     // 转换请求
@@ -853,6 +886,38 @@ pub async fn post_messages_cc(
         };
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
+    }
+
+    // 检查是否为 WebFetch 请求
+    if webfetch::has_web_fetch_tool(&payload) {
+        tracing::info!("检测到 WebFetch 工具，路由到 WebFetch 处理");
+
+        // 估算输入 tokens
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        let cache_split = if state.simulate_cache {
+            Some(
+                cache_sim::compute_split(
+                    &cache_scope_key(&payload),
+                    &payload.model,
+                    payload.cache_control.as_ref(),
+                    payload.system.as_deref(),
+                    &payload.messages,
+                    payload.tools.as_deref(),
+                    input_tokens,
+                )
+                .dampen_read(state.simulate_cache_read_factor),
+            )
+        } else {
+            None
+        };
+
+        return webfetch::handle_webfetch_request(provider, &payload, input_tokens, cache_split).await;
     }
 
     // 转换请求
