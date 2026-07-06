@@ -29,11 +29,12 @@ use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, Messa
 use super::server_tools;
 use super::websearch;
 
-/// 按 admin 实时可调的比例计算模拟缓存拆分；未启用时返回 `None`。
+/// 按 admin 实时可调的比例计算模拟缓存拆分（带每请求 ±1%~3% 随机浮动）；
+/// 未启用时返回 `None`。
 fn ratio_cache_split(state: &AppState, total_input_tokens: i32) -> Option<CacheSplit> {
     let settings = &state.sim_cache;
     settings.enabled().then(|| {
-        cache_sim::compute_split(
+        cache_sim::compute_split_jittered(
             total_input_tokens,
             settings.read_ratio(),
             settings.write_ratio(),

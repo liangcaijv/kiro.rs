@@ -179,7 +179,8 @@ pub struct Config {
     /// 模拟缓存读取占比（0.0~1.0，默认 0.8）
     ///
     /// 仅在 `simulate_cache=true` 时生效。每次请求把总输入 token 的该比例计入
-    /// `cache_read_input_tokens`（按约 1/10 价计费）。
+    /// `cache_read_input_tokens`（按约 1/10 价计费）。实际拆分时会在该基准上
+    /// 叠加每请求 ±1%~3%（绝对百分点）的随机浮动，避免结果一成不变。
     #[serde(default = "default_simulate_cache_read_ratio")]
     pub simulate_cache_read_ratio: f64,
 
@@ -189,6 +190,7 @@ pub struct Config {
     /// `cache_creation_input_tokens`（按约 1.25 倍价计费），剩余部分计入正常
     /// `input_tokens`。`read + write` 之和应 ≤ 1，超出时读取优先、写入让位。
     /// 恒等式 `input + cache_creation + cache_read == 总输入` 始终成立。
+    /// 与读取占比一样，实际拆分带每请求 ±1%~3% 的随机浮动。
     #[serde(default = "default_simulate_cache_write_ratio")]
     pub simulate_cache_write_ratio: f64,
 

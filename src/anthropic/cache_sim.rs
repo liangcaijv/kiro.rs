@@ -13,6 +13,9 @@
 //! 无任何跨请求状态。比例可在 admin 控制台实时调整（见
 //! `crate::model::sim_cache::SimulateCacheSettings`）。
 //!
+//! 为避免每次拆分结果一成不变显得太假，生产入口 [`compute_split_jittered`]
+//! 会在配置比例上叠加每请求 ±1%~3%（绝对百分点）的随机浮动。
+//!
 //! 恒等式：`input + cache_creation + cache_read == 总输入 token` 恒成立。
 //!
 //! （历史：2026-06 曾实现有状态的前缀哈希追踪 + moka 缓存 + dampen_read 折扣，
@@ -37,6 +40,34 @@ fn sanitize_ratio(ratio: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// 每请求随机浮动的幅度范围（绝对百分点）。
+const JITTER_MIN: f64 = 0.01;
+const JITTER_MAX: f64 = 0.03;
+
+/// 对配置比例叠加 ±1%~3%（绝对百分点）的随机浮动。
+///
+/// 浮动幅度在 `[1%, 3%]` 内均匀取值、方向随机：每次结果相对配置基准
+/// 至少偏 1 个百分点、至多偏 3 个（两次请求之间的差值则在 0~6 个
+/// 百分点之间，也可能恰好相同）。配置为 0 的比例不浮动——0 表示
+/// 明确关闭该项，不应无中生有。结果夹回 `[0.0, 1.0]`。
+fn jitter_ratio(ratio: f64) -> f64 {
+    let ratio = sanitize_ratio(ratio);
+    if ratio <= 0.0 {
+        return 0.0;
+    }
+    let delta = JITTER_MIN + fastrand::f64() * (JITTER_MAX - JITTER_MIN);
+    let jittered = if fastrand::bool() { ratio + delta } else { ratio - delta };
+    jittered.clamp(0.0, 1.0)
+}
+
+/// 生产入口：在配置比例上叠加随机浮动后计算拆分。
+///
+/// 拆分规则与 [`compute_split`] 完全一致，仅比例带浮动；
+/// 恒等式 `input + cache_creation + cache_read == total` 同样恒成立。
+pub fn compute_split_jittered(total_input_tokens: i32, read_ratio: f64, write_ratio: f64) -> CacheSplit {
+    compute_split(total_input_tokens, jitter_ratio(read_ratio), jitter_ratio(write_ratio))
 }
 
 /// 按固定比例计算请求的缓存拆分。
@@ -160,5 +191,48 @@ mod tests {
         assert_eq!(split.cache_read_input_tokens, 8_192);
         assert_eq!(split.cache_creation_input_tokens, 0);
         assert_eq!(split.input_tokens, 0);
+    }
+
+    #[test]
+    fn jitter_stays_within_one_to_three_points() {
+        for _ in 0..1_000 {
+            let jittered = jitter_ratio(0.8);
+            let delta = (jittered - 0.8).abs();
+            assert!(
+                (JITTER_MIN..=JITTER_MAX).contains(&delta),
+                "浮动幅度应在 [1%, 3%] 内，实际 {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_clamps_near_boundaries() {
+        for _ in 0..1_000 {
+            let near_one = jitter_ratio(0.995);
+            assert!((0.0..=1.0).contains(&near_one), "{near_one}");
+            let near_zero = jitter_ratio(0.005);
+            assert!((0.0..=1.0).contains(&near_zero), "{near_zero}");
+        }
+    }
+
+    #[test]
+    fn zero_ratio_is_never_jittered() {
+        for _ in 0..100 {
+            assert_eq!(jitter_ratio(0.0), 0.0);
+            assert_eq!(jitter_ratio(-0.5), 0.0);
+            assert_eq!(jitter_ratio(f64::NAN), 0.0);
+        }
+    }
+
+    #[test]
+    fn jittered_split_keeps_identity_and_varies() {
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let split = compute_split_jittered(100_000, 0.8, 0.1);
+            assert_identity(split, 100_000);
+            distinct.insert((split.cache_read_input_tokens, split.cache_creation_input_tokens));
+        }
+        // 200 次拆分不应全部相同（浮动的意义所在）。
+        assert!(distinct.len() > 1, "拆分结果应随请求浮动");
     }
 }
