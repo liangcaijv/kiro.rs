@@ -29,14 +29,16 @@ use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, Messa
 use super::server_tools;
 use super::websearch;
 
-/// 构造模拟缓存的隔离标识：`model | user_id`，防止跨模型/会话串味。
-fn cache_scope_key(payload: &MessagesRequest) -> String {
-    let user_id = payload
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref())
-        .unwrap_or("");
-    format!("{}|{}", payload.model, user_id)
+/// 按 admin 实时可调的比例计算模拟缓存拆分；未启用时返回 `None`。
+fn ratio_cache_split(state: &AppState, total_input_tokens: i32) -> Option<CacheSplit> {
+    let settings = &state.sim_cache;
+    settings.enabled().then(|| {
+        cache_sim::compute_split(
+            total_input_tokens,
+            settings.read_ratio(),
+            settings.write_ratio(),
+        )
+    })
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -265,22 +267,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let cache_split = if state.simulate_cache {
-            Some(
-                cache_sim::compute_split(
-                    &cache_scope_key(&payload),
-                    &payload.model,
-                    payload.cache_control.as_ref(),
-                    payload.system.as_deref(),
-                    &payload.messages,
-                    payload.tools.as_deref(),
-                    input_tokens,
-                )
-                .dampen_read(state.simulate_cache_read_factor),
-            )
-        } else {
-            None
-        };
+        let cache_split = ratio_cache_split(&state, input_tokens);
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
     }
@@ -297,22 +284,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let cache_split = if state.simulate_cache {
-            Some(
-                cache_sim::compute_split(
-                    &cache_scope_key(&payload),
-                    &payload.model,
-                    payload.cache_control.as_ref(),
-                    payload.system.as_deref(),
-                    &payload.messages,
-                    payload.tools.as_deref(),
-                    input_tokens,
-                )
-                .dampen_read(state.simulate_cache_read_factor),
-            )
-        } else {
-            None
-        };
+        let cache_split = ratio_cache_split(&state, input_tokens);
 
         return server_tools::handle_mixed_request(
             provider,
@@ -368,36 +340,15 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens（+ 可选的模拟缓存拆分）。
-    // 关闭模拟缓存时走 move 路径（无 clone），与原先行为完全一致、零额外开销。
-    let (input_tokens, cache_split) = if state.simulate_cache {
-        let scope = cache_scope_key(&payload);
-        let total = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-        let split = cache_sim::compute_split(
-            &scope,
-            &payload.model,
-            payload.cache_control.as_ref(),
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-            total,
-        )
-        .dampen_read(state.simulate_cache_read_factor);
-        (total, Some(split))
-    } else {
-        let total = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system,
-            payload.messages,
-            payload.tools,
-        ) as i32;
-        (total, None)
-    };
+    // 估算输入 tokens（move 掉 payload 的 system/messages/tools：Kiro 请求已转换
+    // 完毕，后续只再用 payload 的标量字段）+ 可选的模拟缓存拆分。
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system,
+        payload.messages,
+        payload.tools,
+    ) as i32;
+    let cache_split = ratio_cache_split(&state, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -875,22 +826,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let cache_split = if state.simulate_cache {
-            Some(
-                cache_sim::compute_split(
-                    &cache_scope_key(&payload),
-                    &payload.model,
-                    payload.cache_control.as_ref(),
-                    payload.system.as_deref(),
-                    &payload.messages,
-                    payload.tools.as_deref(),
-                    input_tokens,
-                )
-                .dampen_read(state.simulate_cache_read_factor),
-            )
-        } else {
-            None
-        };
+        let cache_split = ratio_cache_split(&state, input_tokens);
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
     }
@@ -907,22 +843,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let cache_split = if state.simulate_cache {
-            Some(
-                cache_sim::compute_split(
-                    &cache_scope_key(&payload),
-                    &payload.model,
-                    payload.cache_control.as_ref(),
-                    payload.system.as_deref(),
-                    &payload.messages,
-                    payload.tools.as_deref(),
-                    input_tokens,
-                )
-                .dampen_read(state.simulate_cache_read_factor),
-            )
-        } else {
-            None
-        };
+        let cache_split = ratio_cache_split(&state, input_tokens);
 
         return server_tools::handle_mixed_request(
             provider,
@@ -979,34 +900,13 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens（+ 可选的模拟缓存拆分），逻辑同 /v1 路径。
-    let (input_tokens, cache_split) = if state.simulate_cache {
-        let scope = cache_scope_key(&payload);
-        let total = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-        let split = cache_sim::compute_split(
-            &scope,
-            &payload.model,
-            payload.cache_control.as_ref(),
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-            total,
-        )
-        .dampen_read(state.simulate_cache_read_factor);
-        (total, Some(split))
-    } else {
-        let total = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system,
-            payload.messages,
-            payload.tools,
-        ) as i32;
-        (total, None)
-    };
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system,
+        payload.messages,
+        payload.tools,
+    ) as i32;
+    let cache_split = ratio_cache_split(&state, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload

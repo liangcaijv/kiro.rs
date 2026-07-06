@@ -168,23 +168,29 @@ pub struct Config {
     /// ⚠️ Kiro 后端不支持 prompt 缓存，也不返回缓存 token。启用后代理会在出口
     /// **伪造** `cache_creation_input_tokens` / `cache_read_input_tokens` 字段，
     /// 仅用于让 sub2api 等统计面板的缓存指标不为 0、成本曲线接近真实 Anthropic。
-    /// 它**不会**真的节省 token、额度或耗时。只认客户端真正打的 `cache_control`
-    /// 断点；关闭时行为与原先完全一致。
+    /// 它**不会**真的节省 token、额度或耗时。
+    ///
+    /// 拆分方式：每次请求把估算总输入 token 按下面两个比例直接拆成
+    /// 读取/写入/正常三份，不看客户端 `cache_control` 断点、无跨请求状态。
+    /// 此字段与两个比例都可在 admin 控制台实时调整（改动会写回本配置文件）。
     #[serde(default)]
     pub simulate_cache: bool,
 
-    /// 模拟缓存的读取折扣系数（0.0~1.0，默认 0.3）
+    /// 模拟缓存读取占比（0.0~1.0，默认 0.8）
     ///
-    /// 仅在 `simulate_cache=true` 时生效。Kiro 后端不支持 prompt 缓存，本代理
-    /// 伪造的 `cache_read_input_tokens` 往往把整段稳定的大 system / 历史消息全部
-    /// 算成缓存读取，而缓存读取按约 1/10 价计费，导致面板上每条大请求的扣费极低。
+    /// 仅在 `simulate_cache=true` 时生效。每次请求把总输入 token 的该比例计入
+    /// `cache_read_input_tokens`（按约 1/10 价计费）。
+    #[serde(default = "default_simulate_cache_read_ratio")]
+    pub simulate_cache_read_ratio: f64,
+
+    /// 模拟缓存写入占比（0.0~1.0，默认 0.1）
     ///
-    /// 本系数把伪造出的 cache_read 按 `factor` 衰减：只保留 `read × factor`，差额
-    /// 回退计入 `cache_creation`（按约 1.25 倍计费），从而抬高面板计费。值越小，
-    /// 缓存读取越少、计费越高；`1.0` 表示不衰减（与历史行为一致）。
+    /// 仅在 `simulate_cache=true` 时生效。每次请求把总输入 token 的该比例计入
+    /// `cache_creation_input_tokens`（按约 1.25 倍价计费），剩余部分计入正常
+    /// `input_tokens`。`read + write` 之和应 ≤ 1，超出时读取优先、写入让位。
     /// 恒等式 `input + cache_creation + cache_read == 总输入` 始终成立。
-    #[serde(default = "default_simulate_cache_read_factor")]
-    pub simulate_cache_read_factor: f64,
+    #[serde(default = "default_simulate_cache_write_ratio")]
+    pub simulate_cache_write_ratio: f64,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -249,8 +255,12 @@ fn default_extract_thinking() -> bool {
     true
 }
 
-fn default_simulate_cache_read_factor() -> f64 {
-    0.3
+fn default_simulate_cache_read_ratio() -> f64 {
+    0.8
+}
+
+fn default_simulate_cache_write_ratio() -> f64 {
+    0.1
 }
 
 fn default_endpoint() -> String {
@@ -281,7 +291,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             simulate_cache: false,
-            simulate_cache_read_factor: default_simulate_cache_read_factor(),
+            simulate_cache_read_ratio: default_simulate_cache_read_ratio(),
+            simulate_cache_write_ratio: default_simulate_cache_write_ratio(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             relay: RelayConfig::default(),

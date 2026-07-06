@@ -7,7 +7,8 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
   "simulateCache": false,
-  "simulateCacheReadFactor": 0.3,
+  "simulateCacheReadRatio": 0.8,
+  "simulateCacheWriteRatio": 0.1,
   "relay": {
     "enabled": false,
     "url": "http://64.20.54.18:15001/sendMessage",

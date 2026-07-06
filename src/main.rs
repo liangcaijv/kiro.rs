@@ -17,6 +17,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use model::sim_cache::SimulateCacheSettings;
 
 #[tokio::main]
 async fn main() {
@@ -157,13 +158,20 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 模拟缓存运行时设置：anthropic 路由与 admin 共享同一 Arc，
+    // admin 更新后对后续请求实时生效（改动会写回配置文件）。
+    let sim_cache = Arc::new(SimulateCacheSettings::new(
+        config.simulate_cache,
+        config.simulate_cache_read_ratio,
+        config.simulate_cache_write_ratio,
+    ));
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
-        config.simulate_cache,
-        config.simulate_cache_read_factor,
+        sim_cache.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -179,8 +187,11 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                sim_cache.clone(),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

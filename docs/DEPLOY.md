@@ -144,15 +144,23 @@ curl -s http://127.0.0.1:8990/v1/models -H "x-api-key: <你的 apiKey>" | head
 
 ```json
 {
-  "simulateCache": true
+  "simulateCache": true,
+  "simulateCacheReadRatio": 0.8,
+  "simulateCacheWriteRatio": 0.1
 }
 ```
 
-- 默认 `false`，关闭时行为与原先完全一致、零额外开销。
-- ⚠️ 该字段只是在响应 usage 中**伪造** `cache_creation_input_tokens` / `cache_read_input_tokens`，
+- 默认 `simulateCache: false`。开启后**每次请求**把估算总输入 token 按固定比例拆分：
+  `cache_read = total × readRatio`（默认 0.8）、`cache_creation = total × writeRatio`
+  （默认 0.1）、剩余计入正常 `input_tokens`。不看客户端 `cache_control` 断点、
+  无跨请求状态。两比例之和应 ≤ 1（超出时读取优先、写入让位）。
+- ⚠️ 该功能只是在响应 usage 中**伪造** `cache_creation_input_tokens` / `cache_read_input_tokens`，
   让 sub2api 等面板的缓存指标非 0、成本曲线接近真实 Anthropic。
   Kiro 后端**不支持**真实缓存，**不会**真的节省 token、额度或耗时。
-- 改完配置后需重启对应容器（`./restart.sh` 或 `docker compose up -d`）才生效。
+- 三个字段均可在 Admin 控制台实时调整（`/admin` 顶栏「模拟缓存」按钮），**无需重启**，
+  保存后对后续请求立即生效，并写回配置文件（重启后保持）。也可直接调 API：
+  `GET/PUT /api/admin/config/simulate-cache`，body 如
+  `{"enabled":true,"readRatio":0.8,"writeRatio":0.1}`（省略的字段保持当前值）。
 
 ---
 

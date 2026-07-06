@@ -123,3 +123,17 @@ export interface UpdateCredentialRequest {
   // 中转开关三态字符串：'follow' | 'on' | 'off'
   useRelay?: string
 }
+
+// 模拟缓存设置（enabled + 读/写占比，0~1）
+export interface SimulateCacheConfig {
+  enabled: boolean
+  readRatio: number
+  writeRatio: number
+}
+
+// 设置模拟缓存请求（省略的字段保持当前值不变）
+export interface SetSimulateCacheRequest {
+  enabled?: boolean
+  readRatio?: number
+  writeRatio?: number
+}

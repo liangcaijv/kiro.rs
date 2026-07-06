@@ -10,6 +10,8 @@ import type {
   AddCredentialResponse,
   CredentialDetail,
   UpdateCredentialRequest,
+  SimulateCacheConfig,
+  SetSimulateCacheRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -119,5 +121,17 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取模拟缓存设置
+export async function getSimulateCache(): Promise<SimulateCacheConfig> {
+  const { data } = await api.get<SimulateCacheConfig>('/config/simulate-cache')
+  return data
+}
+
+// 设置模拟缓存（实时生效并写回配置文件）
+export async function setSimulateCache(req: SetSimulateCacheRequest): Promise<SimulateCacheConfig> {
+  const { data } = await api.put<SimulateCacheConfig>('/config/simulate-cache', req)
   return data
 }

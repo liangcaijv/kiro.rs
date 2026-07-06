@@ -11,6 +11,8 @@ import {
   updateCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getSimulateCache,
+  setSimulateCache,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest } from '@/types/api'
 
@@ -129,6 +131,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取模拟缓存设置
+export function useSimulateCache() {
+  return useQuery({
+    queryKey: ['simulateCache'],
+    queryFn: getSimulateCache,
+  })
+}
+
+// 设置模拟缓存（实时生效并写回配置文件）
+export function useSetSimulateCache() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSimulateCache,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['simulateCache'] })
     },
   })
 }

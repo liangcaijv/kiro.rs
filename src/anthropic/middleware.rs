@@ -12,6 +12,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::sim_cache::SimulateCacheSettings;
 
 use super::types::ErrorResponse;
 
@@ -25,11 +26,9 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
-    /// 是否模拟 prompt 缓存命中（伪造 cache_* token 字段）
-    pub simulate_cache: bool,
-    /// 模拟缓存的读取折扣系数（0~1）：把伪造的 cache_read 按此衰减、差额转入
-    /// cache_creation，用于抬高面板计费。仅 simulate_cache=true 时生效。
-    pub simulate_cache_read_factor: f64,
+    /// 模拟 prompt 缓存设置（开关 + 读/写比例）。
+    /// 与 admin 共享同一实例：admin 更新后，后续请求实时读到新值。
+    pub sim_cache: Arc<SimulateCacheSettings>,
 }
 
 impl AppState {
@@ -37,15 +36,13 @@ impl AppState {
     pub fn new(
         api_key: impl Into<String>,
         extract_thinking: bool,
-        simulate_cache: bool,
-        simulate_cache_read_factor: f64,
+        sim_cache: Arc<SimulateCacheSettings>,
     ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
-            simulate_cache,
-            simulate_cache_read_factor,
+            sim_cache,
         }
     }
 

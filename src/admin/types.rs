@@ -304,6 +304,20 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 模拟缓存配置 ============
+
+/// 设置模拟缓存请求（省略的字段保持当前值不变）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSimulateCacheRequest {
+    /// 是否启用模拟缓存
+    pub enabled: Option<bool>,
+    /// 缓存读取占比（0~1）
+    pub read_ratio: Option<f64>,
+    /// 缓存写入占比（0~1，read+write ≤ 1）
+    pub write_ratio: Option<f64>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse, UpdateCredentialRequest,
+        SetSimulateCacheRequest, SuccessResponse, UpdateCredentialRequest,
     },
 };
 
@@ -161,6 +161,25 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/simulate-cache
+/// 获取模拟缓存设置
+pub async fn get_simulate_cache(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_simulate_cache();
+    Json(response)
+}
+
+/// PUT /api/admin/config/simulate-cache
+/// 设置模拟缓存（实时生效并写回配置文件）
+pub async fn set_simulate_cache(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSimulateCacheRequest>,
+) -> impl IntoResponse {
+    match state.service.set_simulate_cache(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

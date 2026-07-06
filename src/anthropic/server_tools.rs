@@ -890,7 +890,6 @@ mod tests {
             description: String::new(),
             input_schema: Default::default(),
             max_uses: None,
-            cache_control: None,
         }
     }
 
@@ -908,7 +907,6 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
-            cache_control: None,
             metadata: None,
         }
     }

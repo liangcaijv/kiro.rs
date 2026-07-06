@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::Config;
+use crate::model::sim_cache::{SimulateCacheSettings, SimulateCacheSnapshot};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialDetailResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, UpdateCredentialRequest,
+    SetLoadBalancingModeRequest, SetSimulateCacheRequest, UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -39,12 +41,15 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 模拟缓存运行时设置（与 anthropic 路由共享同一实例，更新实时生效）
+    sim_cache: Arc<SimulateCacheSettings>,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        sim_cache: Arc<SimulateCacheSettings>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -57,6 +62,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            sim_cache,
         }
     }
 
@@ -389,6 +395,82 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取模拟缓存设置
+    pub fn get_simulate_cache(&self) -> SimulateCacheSnapshot {
+        self.sim_cache.snapshot()
+    }
+
+    /// 设置模拟缓存（省略的字段保持当前值）：先更新共享内存态（对后续请求实时
+    /// 生效），再写回配置文件；持久化失败则回滚内存态。
+    pub fn set_simulate_cache(
+        &self,
+        req: SetSimulateCacheRequest,
+    ) -> Result<SimulateCacheSnapshot, AdminServiceError> {
+        let previous = self.sim_cache.snapshot();
+        let target = SimulateCacheSnapshot {
+            enabled: req.enabled.unwrap_or(previous.enabled),
+            read_ratio: req.read_ratio.unwrap_or(previous.read_ratio),
+            write_ratio: req.write_ratio.unwrap_or(previous.write_ratio),
+        };
+
+        for (name, value) in [
+            ("readRatio", target.read_ratio),
+            ("writeRatio", target.write_ratio),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "{} 必须在 0~1 之间",
+                    name
+                )));
+            }
+        }
+        if target.read_ratio + target.write_ratio > 1.0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "readRatio 与 writeRatio 之和不能超过 1".to_string(),
+            ));
+        }
+
+        self.sim_cache.update(target);
+
+        if let Err(err) = self.persist_simulate_cache(target) {
+            self.sim_cache.update(previous);
+            return Err(AdminServiceError::InternalError(err.to_string()));
+        }
+
+        tracing::info!(
+            "模拟缓存设置已更新: enabled={} readRatio={} writeRatio={}",
+            target.enabled,
+            target.read_ratio,
+            target.write_ratio
+        );
+        Ok(self.sim_cache.snapshot())
+    }
+
+    /// 把模拟缓存设置写回配置文件（重启后保持）。与负载均衡模式的持久化一致：
+    /// 从磁盘重读配置再改字段，避免覆盖其它字段的并发修改。
+    fn persist_simulate_cache(&self, snapshot: SimulateCacheSnapshot) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.token_manager.config().config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，模拟缓存设置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.simulate_cache = snapshot.enabled;
+        config.simulate_cache_read_ratio = snapshot.read_ratio;
+        config.simulate_cache_write_ratio = snapshot.write_ratio;
+        config
+            .save()
+            .with_context(|| format!("持久化模拟缓存设置失败: {}", config_path.display()))?;
+
+        Ok(())
     }
 
     /// 强制刷新指定凭据的 Token

@@ -126,11 +126,6 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
-    /// 顶层自动缓存标记（Anthropic automatic caching）。
-    ///
-    /// Kiro 上游不支持该字段；仅用于 simulate_cache 在响应 usage 中模拟 cache_*。
-    #[serde(default)]
-    pub cache_control: Option<serde_json::Value>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
 }
@@ -232,10 +227,6 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
-    /// 缓存断点标记（`cache_control: {type:"ephemeral"}`），仅用于模拟缓存拆分。
-    /// 不参与向 Kiro 上游的序列化（Kiro 协议无此概念）。
-    #[serde(default, skip_serializing)]
-    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 内容块
