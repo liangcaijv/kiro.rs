@@ -260,16 +260,33 @@ pub struct ContentBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<ImageSource>,
+    pub source: Option<BlockSource>,
+    /// 文档标题（仅 document 块）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 文档上下文说明（仅 document 块）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
-/// 图片数据源
+/// 内容块数据源（image / document 共用）
+///
+/// - image: `{type:"base64", media_type, data}`
+/// - document: base64（PDF）/ text（纯文本）/ content（嵌套内容块）/ url 四种 source
 #[derive(Debug, Deserialize, Serialize)]
-pub struct ImageSource {
+pub struct BlockSource {
     #[serde(rename = "type")]
     pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// content source 的嵌套内容块（仅 document 块）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
+    /// url source 的地址（仅 document 块）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

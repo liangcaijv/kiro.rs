@@ -201,6 +201,33 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     (tool_use_id, request)
 }
 
+/// 将搜索结果转换为 `web_search_tool_result` 块的 content 数组
+/// （`web_search_result` JSON 列表），无结果时返回空数组
+pub(crate) fn search_results_to_result_content(
+    search_results: &Option<WebSearchResults>,
+) -> Vec<serde_json::Value> {
+    let Some(results) = search_results else {
+        return vec![];
+    };
+    results
+        .results
+        .iter()
+        .map(|r| {
+            let page_age = r.published_date.and_then(|ms| {
+                chrono::DateTime::from_timestamp_millis(ms)
+                    .map(|dt| dt.format("%B %-d, %Y").to_string())
+            });
+            json!({
+                "type": "web_search_result",
+                "title": r.title,
+                "url": r.url,
+                "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                "page_age": page_age
+            })
+        })
+        .collect()
+}
+
 /// 解析 MCP 响应中的搜索结果
 pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
     let result = mcp_response.result.as_ref()?;
@@ -339,27 +366,7 @@ fn generate_websearch_events(
 
     // 5. content_block_start (web_search_tool_result, index 2)
     // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
-    let search_content = if let Some(ref results) = search_results {
-        results
-            .results
-            .iter()
-            .map(|r| {
-                let page_age = r.published_date.and_then(|ms| {
-                    chrono::DateTime::from_timestamp_millis(ms)
-                        .map(|dt| dt.format("%B %-d, %Y").to_string())
-                });
-                json!({
-                    "type": "web_search_result",
-                    "title": r.title,
-                    "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": page_age
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    let search_content = search_results_to_result_content(&search_results);
 
     events.push(SseEvent::new(
         "content_block_start",
@@ -531,7 +538,7 @@ pub async fn handle_websearch_request(
 }
 
 /// 调用 Kiro MCP API
-async fn call_mcp_api(
+pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
 ) -> anyhow::Result<McpResponse> {

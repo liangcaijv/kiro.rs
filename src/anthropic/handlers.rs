@@ -26,7 +26,7 @@ use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
-use super::webfetch;
+use super::server_tools;
 use super::websearch;
 
 /// 构造模拟缓存的隔离标识：`model | user_id`，防止跨模型/会话串味。
@@ -40,7 +40,7 @@ fn cache_scope_key(payload: &MessagesRequest) -> String {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+pub(crate) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -285,9 +285,9 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
     }
 
-    // 检查是否为 WebFetch 请求
-    if webfetch::has_web_fetch_tool(&payload) {
-        tracing::info!("检测到 WebFetch 工具，路由到 WebFetch 处理");
+    // 检查是否为 server tool（web_search）与普通工具混用的请求
+    if server_tools::has_mixed_server_tools(&payload) {
+        tracing::info!("检测到 server tool 与普通工具混用，路由到拦截循环处理");
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
@@ -314,7 +314,14 @@ pub async fn post_messages(
             None
         };
 
-        return webfetch::handle_webfetch_request(provider, &payload, input_tokens, cache_split).await;
+        return server_tools::handle_mixed_request(
+            provider,
+            &payload,
+            state.extract_thinking,
+            input_tokens,
+            cache_split,
+        )
+        .await;
     }
 
     // 转换请求
@@ -459,10 +466,10 @@ async fn handle_stream_request(
 }
 
 /// Ping 事件间隔（25秒）
-const PING_INTERVAL_SECS: u64 = 25;
+pub(crate) const PING_INTERVAL_SECS: u64 = 25;
 
 /// 创建 ping 事件的 SSE 字符串
-fn create_ping_sse() -> Bytes {
+pub(crate) fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
@@ -888,9 +895,9 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_split).await;
     }
 
-    // 检查是否为 WebFetch 请求
-    if webfetch::has_web_fetch_tool(&payload) {
-        tracing::info!("检测到 WebFetch 工具，路由到 WebFetch 处理");
+    // 检查是否为 server tool（web_search）与普通工具混用的请求
+    if server_tools::has_mixed_server_tools(&payload) {
+        tracing::info!("检测到 server tool 与普通工具混用，路由到拦截循环处理");
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
@@ -917,7 +924,14 @@ pub async fn post_messages_cc(
             None
         };
 
-        return webfetch::handle_webfetch_request(provider, &payload, input_tokens, cache_split).await;
+        return server_tools::handle_mixed_request(
+            provider,
+            &payload,
+            state.extract_thinking,
+            input_tokens,
+            cache_split,
+        )
+        .await;
     }
 
     // 转换请求

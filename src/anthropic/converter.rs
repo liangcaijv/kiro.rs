@@ -364,10 +364,18 @@ fn process_message_content(
                         }
                         "image" => {
                             if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                if let (Some(media_type), Some(data)) =
+                                    (source.media_type.as_deref(), source.data)
+                                {
+                                    if let Some(format) = get_image_format(media_type) {
+                                        images.push(KiroImage::from_base64(format, data));
+                                    }
                                 }
                             }
+                        }
+                        "document" => {
+                            // Kiro 协议没有文档概念，降级为文本注入
+                            text_parts.push(render_document_block(&block));
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
@@ -407,6 +415,117 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/gif" => Some("gif".to_string()),
         "image/webp" => Some("webp".to_string()),
         _ => None,
+    }
+}
+
+/// 将 document 内容块降级渲染为文本
+///
+/// Kiro 协议只支持图片附件，文档统一以 `<document>` 标签包裹的纯文本注入，
+/// 提取失败时注入说明性占位文本（而非静默丢弃，让模型知道有文档没读到）。
+fn render_document_block(block: &ContentBlock) -> String {
+    let title = block.title.as_deref().unwrap_or("Untitled document");
+
+    let body = match block.source.as_ref().map(extract_document_text) {
+        Some(Ok(text)) => text,
+        Some(Err(reason)) => {
+            tracing::warn!(title = %title, reason = %reason, "document 块提取失败，注入占位文本");
+            format!("[The document could not be processed by the proxy: {}]", reason)
+        }
+        None => {
+            tracing::warn!(title = %title, "document 块缺少 source 字段");
+            "[The document could not be processed by the proxy: missing source]".to_string()
+        }
+    };
+
+    let mut rendered = format!("<document title={:?}>\n", title);
+    if let Some(context) = block.context.as_deref() {
+        rendered.push_str(context);
+        rendered.push_str("\n\n");
+    }
+    rendered.push_str(&body);
+    rendered.push_str("\n</document>");
+    rendered
+}
+
+/// 从 document source 中提取文本
+///
+/// 支持的 source 类型：
+/// - `text`: data 即纯文本
+/// - `content`: 嵌套内容块数组，收集其中的 text 块
+/// - `base64`: 按 media_type 处理，`application/pdf` 本地抽取文本，`text/*` 直接解码
+/// - `url`: 代理侧不发起抓取，返回错误说明
+fn extract_document_text(source: &super::types::BlockSource) -> Result<String, String> {
+    match source.source_type.as_str() {
+        "text" => source
+            .data
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "text source has no data".to_string()),
+        "content" => {
+            let content = source
+                .content
+                .as_ref()
+                .ok_or_else(|| "content source has no content".to_string())?;
+            let mut parts = Vec::new();
+            match content {
+                serde_json::Value::String(s) => parts.push(s.clone()),
+                serde_json::Value::Array(arr) => {
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if parts.is_empty() {
+                Err("content source has no text blocks".to_string())
+            } else {
+                Ok(parts.join("\n"))
+            }
+        }
+        "base64" => {
+            let data = source
+                .data
+                .as_deref()
+                .ok_or_else(|| "base64 source has no data".to_string())?;
+            let media_type = source.media_type.as_deref().unwrap_or("");
+            let bytes = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(data.trim())
+                    .map_err(|e| format!("invalid base64 data: {}", e))?
+            };
+            match media_type {
+                "application/pdf" => extract_pdf_text(&bytes),
+                mt if mt.starts_with("text/") => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                other => Err(format!("unsupported document media_type: {}", other)),
+            }
+        }
+        "url" => Err(format!(
+            "URL documents are not supported by this proxy (url: {})",
+            source.url.as_deref().unwrap_or("unknown")
+        )),
+        other => Err(format!("unsupported document source type: {}", other)),
+    }
+}
+
+/// 本地抽取 PDF 文本
+///
+/// pdf-extract 对畸形 PDF 可能 panic，用 catch_unwind 兜底避免拖垮代理进程。
+fn extract_pdf_text(bytes: &[u8]) -> Result<String, String> {
+    let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes));
+    match result {
+        Ok(Ok(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Err("PDF contains no extractable text (may be scanned images)".to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        Ok(Err(e)) => Err(format!("PDF text extraction failed: {}", e)),
+        Err(_) => Err("PDF text extraction panicked (malformed PDF)".to_string()),
     }
 }
 
@@ -585,6 +704,12 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
     tools
         .iter()
         .map(|t| {
+            // server tool（web_search）使用合成的 Kiro 定义
+            // （Anthropic 定义无 input_schema，直接透传模型无法正确调用）
+            if let Some(spec) = super::server_tools::kiro_tool_spec(t) {
+                return spec;
+            }
+
             let mut description = t.description.clone();
 
             // 对 Write/Edit 工具追加自定义描述后缀
@@ -897,6 +1022,103 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_process_document_text_source() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "请总结这份文档"},
+            {
+                "type": "document",
+                "title": "报告",
+                "source": {"type": "text", "media_type": "text/plain", "data": "文档正文内容"}
+            }
+        ]);
+
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+        assert!(text.contains("请总结这份文档"));
+        assert!(text.contains("<document title=\"报告\">"));
+        assert!(text.contains("文档正文内容"));
+        assert!(text.contains("</document>"));
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+    }
+
+    #[test]
+    fn test_process_document_content_source() {
+        let content = serde_json::json!([{
+            "type": "document",
+            "source": {
+                "type": "content",
+                "content": [
+                    {"type": "text", "text": "第一段"},
+                    {"type": "text", "text": "第二段"}
+                ]
+            },
+            "context": "背景说明"
+        }]);
+
+        let (text, _, _) = process_message_content(&content).unwrap();
+        assert!(text.contains("第一段\n第二段"));
+        assert!(text.contains("背景说明"));
+        assert!(text.contains("Untitled document"));
+    }
+
+    #[test]
+    fn test_process_document_base64_text_plain() {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode("hello from base64");
+        let content = serde_json::json!([{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "text/plain", "data": data}
+        }]);
+
+        let (text, _, _) = process_message_content(&content).unwrap();
+        assert!(text.contains("hello from base64"));
+    }
+
+    #[test]
+    fn test_process_document_url_source_placeholder() {
+        // url source 代理不抓取，应注入占位说明而非静默丢弃
+        let content = serde_json::json!([{
+            "type": "document",
+            "source": {"type": "url", "url": "https://example.com/doc.pdf"}
+        }]);
+
+        let (text, _, _) = process_message_content(&content).unwrap();
+        assert!(text.contains("could not be processed"));
+        assert!(text.contains("https://example.com/doc.pdf"));
+    }
+
+    #[test]
+    fn test_process_document_invalid_pdf() {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode("not a real pdf");
+        let content = serde_json::json!([{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": data}
+        }]);
+
+        // 畸形 PDF 不应 panic，注入错误占位
+        let (text, _, _) = process_message_content(&content).unwrap();
+        assert!(text.contains("could not be processed"));
+    }
+
+    #[test]
+    fn test_process_image_still_works() {
+        // 图片块在 source 字段可选化后应保持原行为
+        let content = serde_json::json!([
+            {"type": "text", "text": "看图"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}
+            }
+        ]);
+
+        let (text, images, _) = process_message_content(&content).unwrap();
+        assert_eq!(text, "看图");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+    }
 
     #[test]
     fn test_map_model_sonnet() {
