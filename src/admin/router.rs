@@ -9,8 +9,9 @@ use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
         get_credential_balance, get_credential_detail, get_load_balancing_mode,
-        get_simulate_cache, reset_failure_count, set_credential_disabled,
-        set_credential_priority, set_load_balancing_mode, set_simulate_cache, update_credential,
+        get_model_mappings, get_simulate_cache, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, set_model_mappings,
+        set_simulate_cache, update_credential,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -32,6 +33,8 @@ use super::{
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `GET /config/simulate-cache` - 获取模拟缓存设置
 /// - `PUT /config/simulate-cache` - 设置模拟缓存（实时生效并写回配置文件）
+/// - `GET /config/model-mappings` - 获取模型映射表
+/// - `PUT /config/model-mappings` - 设置模型映射表（整表替换，实时生效并写回配置文件）
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -61,6 +64,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/simulate-cache",
             get(get_simulate_cache).put(set_simulate_cache),
+        )
+        .route(
+            "/config/model-mappings",
+            get(get_model_mappings).put(set_model_mappings),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

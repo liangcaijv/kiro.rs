@@ -435,12 +435,29 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
-| `*haiku*` | `claude-haiku-4.5` |
+模型映射由 `config.json` 的 `modelMappings` 驱动（省略时使用内置默认表），
+也可在 Admin 控制台「模型映射」中实时编辑（即时生效并写回配置文件，无需重启）。
+
+匹配规则：请求模型名（小写、`.` 归一为 `-` 后）包含某条规则的全部 `keywords`
+即映射到该条 `target`（Kiro 上游模型 ID）；自上而下取第一条命中，顺序同时决定
+`GET /v1/models` 的展示顺序。未命中任何规则的模型返回 400「模型不支持」。
+
+```json
+"modelMappings": [
+  {
+    "id": "claude-sonnet-4-6",          // /v1/models 对外展示的模型 ID
+    "displayName": "Claude Sonnet 4.6",
+    "keywords": ["sonnet", "4-6"],      // 全部包含才命中（"4.6" 与 "4-6" 等价）
+    "target": "claude-sonnet-4.6",      // Kiro 上游实际模型 ID
+    "contextWindow": 1000000,
+    "maxTokens": 64000,
+    "created": 1771286400
+  }
+]
+```
+
+内置默认表见 `config.example.json`：Opus 4.5~4.8、Sonnet 4.5/4.6、Haiku（任意版本 → 4.5）。
+Kiro 上游支持新模型后，在 Admin 控制台加一条规则即可，无需改代码重新部署。
 
 ## Admin（可选）
 
@@ -454,6 +471,7 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET/PUT /api/admin/config/model-mappings` - 查看/整表替换模型映射（实时生效并写回配置文件）
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

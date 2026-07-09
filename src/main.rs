@@ -158,6 +158,14 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 模型映射表：config 驱动、进程级全局，admin 可实时编辑（写回配置文件）。
+    // 配置留空时保留内置默认表。
+    if config.model_mappings.is_empty() {
+        tracing::warn!("modelMappings 为空，使用内置默认映射表");
+    } else {
+        model::model_mapping::update(config.model_mappings.clone());
+    }
+
     // 模拟缓存运行时设置：anthropic 路由与 admin 共享同一 Arc，
     // admin 更新后对后续请求实时生效（改动会写回配置文件）。
     let sim_cache = Arc::new(SimulateCacheSettings::new(

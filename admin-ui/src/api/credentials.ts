@@ -12,6 +12,7 @@ import type {
   UpdateCredentialRequest,
   SimulateCacheConfig,
   SetSimulateCacheRequest,
+  ModelMappingsConfig,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -133,5 +134,17 @@ export async function getSimulateCache(): Promise<SimulateCacheConfig> {
 // 设置模拟缓存（实时生效并写回配置文件）
 export async function setSimulateCache(req: SetSimulateCacheRequest): Promise<SimulateCacheConfig> {
   const { data } = await api.put<SimulateCacheConfig>('/config/simulate-cache', req)
+  return data
+}
+
+// 获取模型映射表
+export async function getModelMappings(): Promise<ModelMappingsConfig> {
+  const { data } = await api.get<ModelMappingsConfig>('/config/model-mappings')
+  return data
+}
+
+// 设置模型映射表（整表替换，实时生效并写回配置文件）
+export async function setModelMappings(req: ModelMappingsConfig): Promise<ModelMappingsConfig> {
+  const { data } = await api.put<ModelMappingsConfig>('/config/model-mappings', req)
   return data
 }

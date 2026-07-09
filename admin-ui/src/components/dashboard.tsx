@@ -13,6 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SimulateCacheDialog } from '@/components/simulate-cache-dialog'
+import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSimulateCache } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -31,6 +32,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [simCacheDialogOpen, setSimCacheDialogOpen] = useState(false)
+  const [modelMappingsDialogOpen, setModelMappingsDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
@@ -565,6 +567,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             >
               {simCacheData ? `模拟缓存 · ${simCacheData.enabled ? '开' : '关'}` : '模拟缓存'}
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setModelMappingsDialogOpen(true)}
+              title="模型映射设置（实时生效）"
+            >
+              模型映射
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -797,6 +807,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <SimulateCacheDialog
         open={simCacheDialogOpen}
         onOpenChange={setSimCacheDialogOpen}
+      />
+
+      {/* 模型映射设置对话框 */}
+      <ModelMappingsDialog
+        open={modelMappingsDialogOpen}
+        onOpenChange={setModelMappingsDialogOpen}
       />
     </div>
   )

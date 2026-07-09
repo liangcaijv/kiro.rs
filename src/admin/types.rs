@@ -318,6 +318,24 @@ pub struct SetSimulateCacheRequest {
     pub write_ratio: Option<f64>,
 }
 
+// ============ 模型映射配置 ============
+
+/// 模型映射列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingsResponse {
+    /// 当前映射规则（顺序即匹配优先级与 /v1/models 展示顺序）
+    pub mappings: Vec<crate::model::model_mapping::ModelMapping>,
+}
+
+/// 设置模型映射请求（整表替换）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelMappingsRequest {
+    /// 新的完整映射规则列表
+    pub mappings: Vec<crate::model::model_mapping::ModelMapping>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -14,5 +14,14 @@
     "url": "http://64.20.54.18:15001/sendMessage",
     "mcpUrl": "http://64.20.54.18:15001/mcp",
     "apiKey": "sk-your-relay-key"
-  }
+  },
+  "modelMappings": [
+    { "id": "claude-opus-4-8", "displayName": "Claude Opus 4.8", "keywords": ["opus", "4-8"], "target": "claude-opus-4.8", "contextWindow": 1000000, "maxTokens": 128000, "created": 1779897600 },
+    { "id": "claude-opus-4-7", "displayName": "Claude Opus 4.7", "keywords": ["opus", "4-7"], "target": "claude-opus-4.7", "contextWindow": 1000000, "maxTokens": 64000, "created": 1776276000 },
+    { "id": "claude-opus-4-6", "displayName": "Claude Opus 4.6", "keywords": ["opus", "4-6"], "target": "claude-opus-4.6", "contextWindow": 1000000, "maxTokens": 64000, "created": 1770163200 },
+    { "id": "claude-sonnet-4-6", "displayName": "Claude Sonnet 4.6", "keywords": ["sonnet", "4-6"], "target": "claude-sonnet-4.6", "contextWindow": 1000000, "maxTokens": 64000, "created": 1771286400 },
+    { "id": "claude-opus-4-5-20251101", "displayName": "Claude Opus 4.5", "keywords": ["opus", "4-5"], "target": "claude-opus-4.5", "contextWindow": 200000, "maxTokens": 64000, "created": 1763942400 },
+    { "id": "claude-sonnet-4-5-20250929", "displayName": "Claude Sonnet 4.5", "keywords": ["sonnet", "4-5"], "target": "claude-sonnet-4.5", "contextWindow": 200000, "maxTokens": 64000, "created": 1759104000 },
+    { "id": "claude-haiku-4-5-20251001", "displayName": "Claude Haiku 4.5", "keywords": ["haiku"], "target": "claude-haiku-4.5", "contextWindow": 200000, "maxTokens": 64000, "created": 1760486400 }
+  ]
 }

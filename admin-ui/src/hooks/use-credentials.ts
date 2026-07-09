@@ -13,6 +13,8 @@ import {
   setLoadBalancingMode,
   getSimulateCache,
   setSimulateCache,
+  getModelMappings,
+  setModelMappings,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest } from '@/types/api'
 
@@ -150,6 +152,25 @@ export function useSetSimulateCache() {
     mutationFn: setSimulateCache,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['simulateCache'] })
+    },
+  })
+}
+
+// 获取模型映射表
+export function useModelMappings() {
+  return useQuery({
+    queryKey: ['modelMappings'],
+    queryFn: getModelMappings,
+  })
+}
+
+// 设置模型映射表（整表替换，实时生效并写回配置文件）
+export function useSetModelMappings() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelMappings,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelMappings'] })
     },
   })
 }

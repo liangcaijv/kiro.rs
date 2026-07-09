@@ -11,13 +11,15 @@ use serde::{Deserialize, Serialize};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
+use crate::model::model_mapping::{self, ModelMapping};
 use crate::model::sim_cache::{SimulateCacheSettings, SimulateCacheSnapshot};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialDetailResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, SetSimulateCacheRequest, UpdateCredentialRequest,
+    ModelMappingsResponse, SetLoadBalancingModeRequest, SetModelMappingsRequest,
+    SetSimulateCacheRequest, UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -469,6 +471,129 @@ impl AdminService {
         config
             .save()
             .with_context(|| format!("持久化模拟缓存设置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 获取当前模型映射表
+    pub fn get_model_mappings(&self) -> ModelMappingsResponse {
+        ModelMappingsResponse {
+            mappings: model_mapping::current().as_ref().clone(),
+        }
+    }
+
+    /// 设置模型映射表（整表替换）：先更新全局内存表（对后续请求实时生效），
+    /// 再写回配置文件；持久化失败则回滚内存态。
+    pub fn set_model_mappings(
+        &self,
+        req: SetModelMappingsRequest,
+    ) -> Result<ModelMappingsResponse, AdminServiceError> {
+        let mappings = Self::validate_model_mappings(req.mappings)?;
+
+        let previous = model_mapping::current();
+        model_mapping::update(mappings.clone());
+
+        if let Err(err) = self.persist_model_mappings(&mappings) {
+            model_mapping::update(previous.as_ref().clone());
+            return Err(AdminServiceError::InternalError(err.to_string()));
+        }
+
+        tracing::info!("模型映射表已更新: {} 条规则", mappings.len());
+        Ok(ModelMappingsResponse { mappings })
+    }
+
+    /// 校验并规整映射规则（trim 字符串字段，拒绝空值/重复 id/非法数值）
+    fn validate_model_mappings(
+        mappings: Vec<ModelMapping>,
+    ) -> Result<Vec<ModelMapping>, AdminServiceError> {
+        if mappings.is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "映射规则不能为空".to_string(),
+            ));
+        }
+
+        let mut seen_ids = HashSet::new();
+        let mut normalized = Vec::with_capacity(mappings.len());
+        for (index, mut m) in mappings.into_iter().enumerate() {
+            let row = index + 1;
+            m.id = m.id.trim().to_string();
+            m.display_name = m.display_name.trim().to_string();
+            m.target = m.target.trim().to_string();
+            m.keywords = m
+                .keywords
+                .iter()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+
+            if m.id.is_empty() {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "第 {} 条规则的 id 不能为空",
+                    row
+                )));
+            }
+            if m.display_name.is_empty() {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "第 {} 条规则的 displayName 不能为空",
+                    row
+                )));
+            }
+            if m.target.is_empty() {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "第 {} 条规则的 target 不能为空",
+                    row
+                )));
+            }
+            if m.keywords.is_empty() {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "第 {} 条规则的 keywords 不能为空",
+                    row
+                )));
+            }
+            if m.context_window <= 0 {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "第 {} 条规则的 contextWindow 必须大于 0",
+                    row
+                )));
+            }
+            if m.max_tokens <= 0 {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "第 {} 条规则的 maxTokens 必须大于 0",
+                    row
+                )));
+            }
+            if !seen_ids.insert(m.id.clone()) {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "id 重复: {}",
+                    m.id
+                )));
+            }
+
+            normalized.push(m);
+        }
+
+        Ok(normalized)
+    }
+
+    /// 把模型映射表写回配置文件（重启后保持）。与模拟缓存的持久化一致：
+    /// 从磁盘重读配置再改字段，避免覆盖其它字段的并发修改。
+    fn persist_model_mappings(&self, mappings: &[ModelMapping]) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.token_manager.config().config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，模型映射表仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.model_mappings = mappings.to_vec();
+        config
+            .save()
+            .with_context(|| format!("持久化模型映射表失败: {}", config_path.display()))?;
 
         Ok(())
     }

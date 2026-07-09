@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SetSimulateCacheRequest, SuccessResponse, UpdateCredentialRequest,
+        SetModelMappingsRequest, SetSimulateCacheRequest, SuccessResponse, UpdateCredentialRequest,
     },
 };
 
@@ -161,6 +161,25 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/model-mappings
+/// 获取模型映射表
+pub async fn get_model_mappings(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_model_mappings();
+    Json(response)
+}
+
+/// PUT /api/admin/config/model-mappings
+/// 设置模型映射表（整表替换，实时生效并写回配置文件）
+pub async fn set_model_mappings(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetModelMappingsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_mappings(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

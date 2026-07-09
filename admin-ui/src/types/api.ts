@@ -137,3 +137,20 @@ export interface SetSimulateCacheRequest {
   readRatio?: number
   writeRatio?: number
 }
+
+// 单条模型映射规则：请求模型名（小写、"." 归一为 "-" 后）包含全部 keywords
+// 即映射到 target（Kiro 上游模型 ID）；顺序即匹配优先级与 /v1/models 展示顺序
+export interface ModelMapping {
+  id: string
+  displayName: string
+  keywords: string[]
+  target: string
+  contextWindow: number
+  maxTokens: number
+  created: number
+}
+
+// 模型映射表（GET 响应与 PUT 请求同构，PUT 为整表替换）
+export interface ModelMappingsConfig {
+  mappings: ModelMapping[]
+}

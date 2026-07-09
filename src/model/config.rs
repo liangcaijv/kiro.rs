@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::model_mapping::ModelMapping;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -211,6 +213,15 @@ pub struct Config {
     #[serde(default)]
     pub relay: RelayConfig,
 
+    /// 模型映射表：Anthropic 模型名 → Kiro 上游模型 ID
+    ///
+    /// 每条规则：请求模型名（小写、`.` 归一为 `-` 后）包含全部 `keywords`
+    /// 即映射到 `target`；按顺序取第一条命中，顺序同时决定 `/v1/models`
+    /// 的展示顺序。未命中任何规则的模型返回 400「模型不支持」。
+    /// 可在 admin 控制台实时编辑（改动会写回本配置文件）；留空则使用内置默认表。
+    #[serde(default = "default_model_mappings")]
+    pub model_mappings: Vec<ModelMapping>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -269,6 +280,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_model_mappings() -> Vec<ModelMapping> {
+    super::model_mapping::default_mappings()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -298,6 +313,7 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             relay: RelayConfig::default(),
+            model_mappings: default_model_mappings(),
             config_path: None,
         }
     }
