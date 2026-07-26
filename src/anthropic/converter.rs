@@ -1106,6 +1106,24 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        // sonnet-4-5 不应误匹配为 sonnet-5
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
     fn test_map_model_opus() {
         assert_eq!(
             map_model("claude-opus-4-6"),

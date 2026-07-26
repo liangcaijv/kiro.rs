@@ -16,6 +16,7 @@
     "apiKey": "sk-your-relay-key"
   },
   "modelMappings": [
+    { "id": "claude-sonnet-5", "displayName": "Claude Sonnet 5", "keywords": ["sonnet-5"], "target": "claude-sonnet-5", "contextWindow": 1000000, "maxTokens": 128000, "created": 1782777600 },
     { "id": "claude-opus-4-8", "displayName": "Claude Opus 4.8", "keywords": ["opus", "4-8"], "target": "claude-opus-4.8", "contextWindow": 1000000, "maxTokens": 128000, "created": 1779897600 },
     { "id": "claude-opus-4-7", "displayName": "Claude Opus 4.7", "keywords": ["opus", "4-7"], "target": "claude-opus-4.7", "contextWindow": 1000000, "maxTokens": 64000, "created": 1776276000 },
     { "id": "claude-opus-4-6", "displayName": "Claude Opus 4.6", "keywords": ["opus", "4-6"], "target": "claude-opus-4.6", "contextWindow": 1000000, "maxTokens": 64000, "created": 1770163200 },

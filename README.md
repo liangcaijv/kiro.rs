@@ -456,7 +456,10 @@ RUST_LOG=debug ./target/release/kiro-rs
 ]
 ```
 
-内置默认表见 `config.example.json`：Opus 4.5~4.8、Sonnet 4.5/4.6、Haiku（任意版本 → 4.5）。
+内置默认表见 `config.example.json`：Sonnet 5、Opus 4.5~4.8、Sonnet 4.5/4.6、Haiku（任意版本 → 4.5）。
+
+注意：Sonnet 5 的 keyword 必须用整段 `"sonnet-5"`，拆成 `["sonnet", "5"]` 会连带命中
+`claude-sonnet-4-5-*`（其含 "sonnet" 与 "5"），导致 Sonnet 4.5 请求被错误映射。
 Kiro 上游支持新模型后，在 Admin 控制台加一条规则即可，无需改代码重新部署。
 
 ## Admin（可选）

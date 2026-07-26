@@ -77,6 +77,8 @@ pub fn default_mappings() -> Vec<ModelMapping> {
     }
 
     vec![
+        // keyword 必须用 "sonnet-5" 整段：拆成 ["sonnet","5"] 会连带命中 sonnet-4-5
+        entry("claude-sonnet-5", "Claude Sonnet 5", &["sonnet-5"], "claude-sonnet-5", 1_000_000, 128_000, 1_782_777_600),
         entry("claude-opus-4-8", "Claude Opus 4.8", &["opus", "4-8"], "claude-opus-4.8", 1_000_000, 128_000, 1_779_897_600),
         entry("claude-opus-4-7", "Claude Opus 4.7", &["opus", "4-7"], "claude-opus-4.7", 1_000_000, 64_000, 1_776_276_000),
         entry("claude-opus-4-6", "Claude Opus 4.6", &["opus", "4-6"], "claude-opus-4.6", 1_000_000, 64_000, 1_770_163_200),
@@ -150,8 +152,18 @@ mod tests {
         let m = resolve("claude-haiku-9-9").expect("haiku 应命中");
         assert_eq!(m.target, "claude-haiku-4.5");
 
+        // Kiro 已上线 claude-sonnet-5（1M 上下文），keyword 用 "sonnet-5"
+        // 避免误伤 sonnet-4-5（后者含 "sonnet" 与 "5" 但不含 "sonnet-5"）
+        let m = resolve("claude-sonnet-5").expect("sonnet 5 应命中");
+        assert_eq!(m.target, "claude-sonnet-5");
+        assert_eq!(m.context_window, 1_000_000);
+        let m = resolve("claude-sonnet-5-thinking").expect("sonnet 5 thinking 应命中");
+        assert_eq!(m.target, "claude-sonnet-5");
+        let m = resolve("claude-sonnet-4-5-20250929").expect("sonnet 4.5 应命中");
+        assert_eq!(m.target, "claude-sonnet-4.5");
+
         assert!(resolve("gpt-4").is_none());
-        assert!(resolve("claude-sonnet-5").is_none(), "未配置的版本不应命中");
+        assert!(resolve("claude-sonnet-6").is_none(), "未配置的版本不应命中");
     }
 
     #[test]
